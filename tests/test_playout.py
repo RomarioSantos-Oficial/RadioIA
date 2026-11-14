@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import tempfile
 import threading
 import unittest
 import wave
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import app as playout
@@ -87,6 +88,103 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
             pass
         with self.assertRaises(sqlite3.ProgrammingError):
             con.execute("SELECT 1")
+
+    async def test_ticker_weather_seeds_brazilian_capitals_and_one_random_city(self) -> None:
+        expected_states = {state for _, state, _, _ in playout.BRAZIL_STATE_CAPITALS}
+        expected_random_cities = {name for name, _, _, _ in playout.BRAZIL_RANDOM_WEATHER_CITIES}
+        with playout.db() as con:
+            cities = con.execute(
+                "SELECT name,admin1 FROM ticker_weather_cities"
+            ).fetchall()
+        self.assertEqual(len(cities), 28)
+        self.assertEqual({city["admin1"] for city in cities}, expected_states)
+        self.assertEqual(sum(city["name"] in expected_random_cities for city in cities), 1)
+
+        playout.init_db()
+        with playout.db() as con:
+            city_count = con.execute("SELECT COUNT(*) FROM ticker_weather_cities").fetchone()[0]
+        self.assertEqual(city_count, 28)
+
+    async def test_ticker_weather_allows_manual_cities_beyond_old_limit(self) -> None:
+        for index in range(12):
+            await playout.add_ticker_weather_city(playout.TickerWeatherCityIn(
+                name=f"Cidade teste {index}",
+                admin1="",
+                country="Teste",
+                latitude=-60 + index / 10,
+                longitude=100 + index / 10,
+            ))
+        with self.assertRaises(playout.HTTPException) as error:
+            await playout.add_ticker_weather_city(playout.TickerWeatherCityIn(
+                name="Cidade excedente",
+                admin1="",
+                country="Teste",
+                latitude=-50,
+                longitude=110,
+            ))
+        self.assertEqual(error.exception.status_code, 400)
+
+    def test_ticker_weather_automatically_selects_two_capitals_and_one_city(self) -> None:
+        cities = playout.ticker_weather_cities_for_display()
+        random_city_names = {name for name, _, _, _ in playout.BRAZIL_RANDOM_WEATHER_CITIES}
+        self.assertEqual(len(cities), 3)
+        self.assertEqual(sum(city["id"].startswith("capital-") for city in cities), 2)
+        self.assertEqual(sum(city["name"] in random_city_names for city in cities), 1)
+
+    def test_ticker_pruning_expires_old_news_and_enforces_configured_limit(self) -> None:
+        now = datetime.now(timezone.utc)
+        with playout.db() as con:
+            feed_id = con.execute(
+                "INSERT INTO ticker_feeds(name,url) VALUES(?,?)",
+                ("Fonte de teste", "https://example.com/feed.xml"),
+            ).lastrowid
+            timestamps = [(now - timedelta(hours=13)).isoformat(timespec="microseconds")]
+            timestamps.extend(
+                (now - timedelta(hours=index)).isoformat(timespec="microseconds")
+                for index in range(6)
+            )
+            for index, timestamp in enumerate(timestamps):
+                con.execute(
+                    """INSERT INTO ticker_items(feed_id,external_id,text,updated_at,published_at)
+                       VALUES(?,?,?,?,?)""",
+                    (feed_id, str(index), f"Manchete {index}", timestamp, timestamp),
+                )
+        playout.set_setting(
+            "ticker_config",
+            json.dumps({**playout.TICKER_DEFAULTS, "max_news_items": 5}),
+        )
+        playout.prune_ticker_items(now)
+        with playout.db() as con:
+            rows = con.execute(
+                "SELECT text FROM ticker_items WHERE feed_id=? ORDER BY updated_at DESC",
+                (feed_id,),
+            ).fetchall()
+        self.assertEqual(len(rows), 5)
+        self.assertNotIn("Manchete 0", {row["text"] for row in rows})
+
+    def test_ticker_feed_keeps_only_recently_published_news(self) -> None:
+        now = datetime.now(timezone.utc)
+        recent = (now - timedelta(hours=2)).isoformat()
+        old = (now - timedelta(hours=13)).isoformat()
+        future = (now + timedelta(hours=1)).isoformat()
+        payload = f"""<rss><channel>
+          <item><title>Recente</title><pubDate>{recent}</pubDate></item>
+          <item><title>Antiga</title><pubDate>{old}</pubDate></item>
+          <item><title>Futura</title><pubDate>{future}</pubDate></item>
+        </channel></rss>""".encode()
+        entries = playout.parse_ticker_payload(payload)
+        fresh = playout.ticker_fresh_entries(entries, now)
+        self.assertEqual([entry["text"] for entry in fresh], ["Recente"])
+
+    def test_ticker_feed_parses_rss_and_json_publication_dates(self) -> None:
+        rss = b"<rss><channel><item><title>RSS</title><pubDate>Sat, 14 Nov 2026 10:00:00 GMT</pubDate></item></channel></rss>"
+        rss_entry = playout.parse_ticker_payload(rss)[0]
+        self.assertTrue(rss_entry["published_at"].startswith("2026-11-14T10:00:00"))
+        json_entry = playout.parse_ticker_payload(
+            b'[{"title":"JSON","published_at":"2026-11-14T10:00:00Z"}]',
+            "application/json",
+        )[0]
+        self.assertTrue(json_entry["published_at"].startswith("2026-11-14T10:00:00"))
 
     async def test_flow_import_reads_categories_and_inserts_ads_at_configured_interval(self) -> None:
         root = self.create_station_root()

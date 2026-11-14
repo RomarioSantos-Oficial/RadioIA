@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import html
 import ipaddress
 import json
@@ -16,13 +19,14 @@ import threading
 import time
 import unicodedata
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date, datetime, time as clock_time, timedelta
+from datetime import date, datetime, time as clock_time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from threading import Event, Lock
 from uuid import uuid4
-from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import urlencode, urlparse
+from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 
@@ -42,6 +46,51 @@ SUPPORTED = {".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg"}
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 WEEKDAYS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
+BRAZIL_STATE_CAPITALS = [
+    ("Rio Branco", "Acre", -9.97472, -67.81),
+    ("Maceió", "Alagoas", -9.66583, -35.73528),
+    ("Macapá", "Amapá", 0.03889, -51.06639),
+    ("Manaus", "Amazonas", -3.10194, -60.025),
+    ("Salvador", "Bahia", -12.97563, -38.49096),
+    ("Fortaleza", "Ceará", -3.71722, -38.54306),
+    ("Brasília", "Distrito Federal", -15.77972, -47.92972),
+    ("Vitória", "Espírito Santo", -20.31944, -40.33778),
+    ("Goiânia", "Goiás", -16.67861, -49.25389),
+    ("São Luís", "Maranhão", -2.52972, -44.30278),
+    ("Cuiabá", "Mato Grosso", -15.59611, -56.09667),
+    ("Campo Grande", "Mato Grosso do Sul", -20.44278, -54.64639),
+    ("Belo Horizonte", "Minas Gerais", -19.92083, -43.93778),
+    ("Belém", "Pará", -1.45583, -48.50444),
+    ("João Pessoa", "Paraíba", -7.115, -34.86306),
+    ("Curitiba", "Paraná", -25.42778, -49.27306),
+    ("Recife", "Pernambuco", -8.05389, -34.88111),
+    ("Teresina", "Piauí", -5.08917, -42.80194),
+    ("Rio de Janeiro", "Rio de Janeiro", -22.90642, -43.18223),
+    ("Natal", "Rio Grande do Norte", -5.795, -35.20944),
+    ("Porto Alegre", "Rio Grande do Sul", -30.03283, -51.23019),
+    ("Porto Velho", "Rondônia", -8.76194, -63.90389),
+    ("Boa Vista", "Roraima", 2.81972, -60.67333),
+    ("Florianópolis", "Santa Catarina", -27.59667, -48.54917),
+    ("São Paulo", "São Paulo", -23.5475, -46.63611),
+    ("Aracaju", "Sergipe", -10.91111, -37.07167),
+    ("Palmas", "Tocantins", -10.16745, -48.32766),
+]
+BRAZIL_RANDOM_WEATHER_CITIES = [
+    ("Campinas", "São Paulo", -22.90556, -47.06083),
+    ("Santos", "São Paulo", -23.96083, -46.33361),
+    ("Uberlândia", "Minas Gerais", -18.91861, -48.27722),
+    ("Juiz de Fora", "Minas Gerais", -21.76417, -43.35028),
+    ("Londrina", "Paraná", -23.31028, -51.16278),
+    ("Maringá", "Paraná", -23.42528, -51.93861),
+    ("Joinville", "Santa Catarina", -26.30444, -48.84556),
+    ("Caxias do Sul", "Rio Grande do Sul", -29.16806, -51.17944),
+    ("Feira de Santana", "Bahia", -12.26667, -38.96667),
+    ("Petrolina", "Pernambuco", -9.39861, -40.50083),
+    ("Santarém", "Pará", -2.44306, -54.70833),
+    ("Juazeiro do Norte", "Ceará", -7.21306, -39.31528),
+    ("Anápolis", "Goiás", -16.32667, -48.95278),
+    ("São José dos Campos", "São Paulo", -23.17944, -45.88694),
+]
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("playout")
 SCAN_JOBS: dict[str, dict[str, Any]] = {}
@@ -168,7 +217,22 @@ def init_db() -> None:
             source_name TEXT NOT NULL DEFAULT 'Manual',
             active INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0,
+            color TEXT NOT NULL DEFAULT '#FFFFFF',
+            image_path TEXT NOT NULL DEFAULT '',
+            original_text TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
             UNIQUE(feed_id,external_id)
+        );
+        CREATE TABLE IF NOT EXISTS ticker_weather_cities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            admin1 TEXT NOT NULL DEFAULT '',
+            country TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            timezone TEXT NOT NULL DEFAULT 'auto',
+            sort_order INTEGER NOT NULL DEFAULT 0
         );
         INSERT OR IGNORE INTO settings(key,value) VALUES('automation','0');
         INSERT OR IGNORE INTO settings(key,value) VALUES('background_path','');
@@ -228,6 +292,21 @@ def init_db() -> None:
             con.execute("ALTER TABLE flow_programs ADD COLUMN content_type TEXT NOT NULL DEFAULT 'general'")
         if "ticker_enabled" not in program_columns:
             con.execute("ALTER TABLE flow_programs ADD COLUMN ticker_enabled INTEGER NOT NULL DEFAULT 0")
+        ticker_columns = {row["name"] for row in con.execute("PRAGMA table_info(ticker_items)")}
+        if "color" not in ticker_columns:
+            con.execute("ALTER TABLE ticker_items ADD COLUMN color TEXT NOT NULL DEFAULT '#FFFFFF'")
+        if "image_path" not in ticker_columns:
+            con.execute("ALTER TABLE ticker_items ADD COLUMN image_path TEXT NOT NULL DEFAULT ''")
+        if "original_text" not in ticker_columns:
+            con.execute("ALTER TABLE ticker_items ADD COLUMN original_text TEXT NOT NULL DEFAULT ''")
+        if "updated_at" not in ticker_columns:
+            con.execute("ALTER TABLE ticker_items ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        if "published_at" not in ticker_columns:
+            con.execute("ALTER TABLE ticker_items ADD COLUMN published_at TEXT NOT NULL DEFAULT ''")
+        con.execute(
+            "UPDATE ticker_items SET updated_at=? WHERE updated_at=''",
+            (local_now().isoformat(timespec="seconds"),),
+        )
         flow_columns = {row["name"] for row in con.execute("PRAGMA table_info(flows)")}
         if "recursive" not in flow_columns:
             con.execute("ALTER TABLE flows ADD COLUMN recursive INTEGER NOT NULL DEFAULT 1")
@@ -236,6 +315,31 @@ def init_db() -> None:
         schedule_columns = {row["name"] for row in con.execute("PRAGMA table_info(schedules)")}
         if "schedule_date" not in schedule_columns:
             con.execute("ALTER TABLE schedules ADD COLUMN schedule_date TEXT")
+        seeded_weather = con.execute(
+            "SELECT value FROM settings WHERE key='ticker_weather_defaults_seeded'"
+        ).fetchone()
+        if not seeded_weather:
+            order = int(con.execute(
+                "SELECT COALESCE(MAX(sort_order),-1)+1 FROM ticker_weather_cities"
+            ).fetchone()[0])
+            default_cities = [*BRAZIL_STATE_CAPITALS, random.choice(BRAZIL_RANDOM_WEATHER_CITIES)]
+            for name, state, latitude, longitude in default_cities:
+                exists = con.execute(
+                    "SELECT 1 FROM ticker_weather_cities WHERE ABS(latitude-?)<0.001 AND ABS(longitude-?)<0.001",
+                    (latitude, longitude),
+                ).fetchone()
+                if exists:
+                    continue
+                con.execute(
+                    """INSERT INTO ticker_weather_cities
+                       (name,admin1,country,latitude,longitude,timezone,sort_order)
+                       VALUES(?,?, 'Brasil', ?, ?, 'auto', ?)""",
+                    (name, state, latitude, longitude, order),
+                )
+                order += 1
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES('ticker_weather_defaults_seeded','1')"
+            )
 
 
 def switch_workspace(root: Path) -> None:
@@ -291,6 +395,446 @@ def get_setting(key: str, default: str = "") -> str:
 def set_setting(key: str, value: str) -> None:
     with db() as con:
         con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+TICKER_CATEGORIES = {"general", "news", "music", "culture"}
+TICKER_NEWS_RETENTION = timedelta(hours=12)
+TICKER_WEATHER_CACHE: dict[str, Any] = {"updated": 0.0, "items": [], "error": ""}
+DEFAULT_TICKER_FEEDS = (
+    ("G1 - Últimas notícias", "https://g1.globo.com/rss/g1/", "general"),
+    ("G1 - Mundo", "https://g1.globo.com/rss/g1/mundo/", "general"),
+    ("G1 - Tecnologia e games", "https://g1.globo.com/rss/g1/tecnologia/", "general"),
+    ("G1 - Cultura", "https://g1.globo.com/rss/g1/pop-arte/", "general"),
+    ("G1 - Música", "https://g1.globo.com/rss/g1/musica/", "general"),
+    ("UOL - Notícias", "https://rss.uol.com.br/feed/noticias.xml", "general"),
+    ("CNN Brasil", "https://www.cnnbrasil.com.br/feed/", "general"),
+    ("Poder360", "https://www.poder360.com.br/feed/", "general"),
+    ("BBC News Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml", "general"),
+)
+
+
+def get_ticker_config() -> dict[str, Any]:
+    try:
+        stored = json.loads(get_setting("ticker_config", "{}"))
+    except (ValueError, TypeError):
+        stored = {}
+    config = {**TICKER_DEFAULTS, **stored}
+    if config.get("speed_seconds") == 32:
+        config["speed_seconds"] = 90
+    config["max_news_items"] = min(20, max(5, int(config.get("max_news_items", 15))))
+    if config.get("position") not in ("top", "bottom"):
+        config["position"] = "bottom"
+    return config
+
+
+def clean_ticker_text(value: Any) -> str:
+    text = html.unescape(re.sub(r"<[^>]*>", " ", str(value or "")))
+    return re.sub(r"\s+", " ", text).strip()[:360]
+
+
+def translate_ticker_news(text: str) -> str:
+    translated_parts = []
+    parts = []
+    current = ""
+    for character in text:
+        if current and len((current + character).encode("utf-8")) > 450:
+            parts.append(current)
+            current = ""
+        current += character
+    if current:
+        parts.append(current)
+    for part in parts:
+        params = urlencode({"q": part, "langpair": "autodetect|pt-BR"})
+        request = UrlRequest(
+            f"https://api.mymemory.translated.net/get?{params}",
+            headers={"User-Agent": "PlayoutTicker/1.0", "Accept": "application/json"},
+        )
+        with build_opener().open(request, timeout=15) as response:
+            payload = json.loads(response.read(1_000_001))
+        translated = payload.get("responseData", {}).get("translatedText")
+        if payload.get("responseStatus") != 200 or not translated or "MYMEMORY WARNING" in translated.upper():
+            raise ValueError(payload.get("responseDetails") or "O serviço de tradução não retornou a manchete.")
+        translated_parts.append(clean_ticker_text(translated))
+    return clean_ticker_text(" ".join(translated_parts))
+
+
+def save_ticker_image(image_data: str | None) -> str:
+    if not image_data:
+        return ""
+    try:
+        content = base64.b64decode(image_data, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise HTTPException(400, "A imagem enviada não é válida.") from exc
+    if len(content) > 3_000_000:
+        raise HTTPException(413, "A imagem deve ter no máximo 3 MB.")
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = ".png"
+    elif content.startswith(b"\xff\xd8\xff"):
+        extension = ".jpg"
+    elif content.startswith((b"GIF87a", b"GIF89a")):
+        extension = ".gif"
+    elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        extension = ".webp"
+    else:
+        raise HTTPException(400, "Use uma imagem PNG, JPG, GIF ou WebP.")
+    filename = f"{uuid4().hex}{extension}"
+    image_dir = DATA_DIR / "ticker_images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / filename).write_bytes(content)
+    return filename
+
+
+def ticker_item_output(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = row_dict(row)
+    filename = item.pop("image_path", "")
+    item["image_url"] = f"/api/ticker/images/{filename}" if filename else ""
+    if "active" in item:
+        item["active"] = bool(item["active"])
+    return item
+
+
+def weather_search_results(name: str) -> list[dict[str, Any]]:
+    params = urlencode({"name": name, "count": 10, "language": "pt", "format": "json"})
+    request = UrlRequest(
+        f"https://geocoding-api.open-meteo.com/v1/search?{params}",
+        headers={"User-Agent": "PlayoutTicker/1.0", "Accept": "application/json"},
+    )
+    with build_opener().open(request, timeout=10) as response:
+        payload = json.loads(response.read(1_000_001))
+    return [
+        {
+            "name": item["name"],
+            "admin1": item.get("admin1") or "",
+            "country": item.get("country") or "",
+            "latitude": item["latitude"],
+            "longitude": item["longitude"],
+            "timezone": item.get("timezone") or "auto",
+        }
+        for item in payload.get("results", [])
+        if isinstance(item, dict) and "name" in item and "latitude" in item and "longitude" in item
+    ]
+
+
+def fetch_ticker_weather(cities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    descriptions = {
+        0: "céu limpo", 1: "poucas nuvens", 2: "parcialmente nublado", 3: "nublado",
+        45: "neblina", 48: "neblina", 51: "garoa", 53: "garoa", 55: "garoa",
+        61: "chuva fraca", 63: "chuva", 65: "chuva forte", 71: "neve", 73: "neve",
+        75: "neve forte", 80: "pancadas de chuva", 81: "pancadas de chuva",
+        82: "pancadas fortes", 95: "trovoadas", 96: "trovoadas", 99: "trovoadas fortes",
+    }
+    brazil_states = {
+        "acre": "AC", "alagoas": "AL", "amapa": "AP", "amazonas": "AM", "bahia": "BA",
+        "ceara": "CE", "distrito federal": "DF", "espirito santo": "ES", "goias": "GO",
+        "maranhao": "MA", "mato grosso": "MT", "mato grosso do sul": "MS", "minas gerais": "MG",
+        "para": "PA", "paraiba": "PB", "parana": "PR", "pernambuco": "PE", "piaui": "PI",
+        "rio de janeiro": "RJ", "rio grande do norte": "RN", "rio grande do sul": "RS",
+        "rondonia": "RO", "roraima": "RR", "santa catarina": "SC", "sao paulo": "SP",
+        "sergipe": "SE", "tocantins": "TO",
+    }
+
+    def normalized(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        return " ".join("".join(char for char in decomposed if not unicodedata.combining(char)).split())
+
+    items = []
+
+    def fetch_city(city: dict[str, Any]) -> dict[str, Any]:
+        params = urlencode({
+            "latitude": city["latitude"],
+            "longitude": city["longitude"],
+            "current": "temperature_2m,weather_code",
+            "timezone": city["timezone"] or "auto",
+        })
+        request = UrlRequest(
+            f"https://api.open-meteo.com/v1/forecast?{params}",
+            headers={"User-Agent": "PlayoutTicker/1.0", "Accept": "application/json"},
+        )
+        with build_opener().open(request, timeout=10) as response:
+            payload = json.loads(response.read(1_000_001))
+        current = payload.get("current", {})
+        temperature = current.get("temperature_2m")
+        if temperature is None:
+            raise ValueError(f"A API de clima não retornou temperatura para {city['name']}.")
+        country = normalized(city["country"])
+        state = normalized(city["admin1"])
+        if country in ("brasil", "brazil") and state in brazil_states:
+            location = f"{city['name']} {brazil_states[state]}"
+        else:
+            location = ", ".join(part for part in (city["name"], city["admin1"], city["country"]) if part)
+        description = descriptions.get(current.get("weather_code"))
+        detail = f", {description}" if description else ""
+        return {
+            "id": f"weather-{city['id']}",
+            "text": f"{location} {temperature:.0f}°C{detail}",
+            "category": "general",
+            "color": "#FDE68A",
+            "image_url": "",
+            "active": True,
+            "sort_order": 1_000_000 + city["id"],
+        }
+
+    with ThreadPoolExecutor(max_workers=min(10, len(cities))) as executor:
+        return list(executor.map(fetch_city, cities))
+
+
+def parse_ticker_published_at(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    parsed: datetime | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return ""
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            try:
+                parsed = datetime.fromtimestamp(float(stripped), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return ""
+        if parsed is not None:
+            return parsed.isoformat(timespec="microseconds")
+        try:
+            parsed = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(stripped)
+            except (TypeError, ValueError, OverflowError):
+                return ""
+    if parsed is None:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def ticker_fresh_entries(entries: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    oldest_allowed = (current - TICKER_NEWS_RETENTION).isoformat(timespec="microseconds")
+    newest_allowed = (current + timedelta(minutes=5)).isoformat(timespec="microseconds")
+    fresh = [
+        entry for entry in entries
+        if entry.get("published_at")
+        and oldest_allowed <= entry["published_at"] <= newest_allowed
+    ]
+    return sorted(fresh, key=lambda entry: entry["published_at"], reverse=True)[:5]
+
+
+def parse_ticker_payload(payload: bytes, content_type: str = "") -> list[dict[str, Any]]:
+    decoded = payload.decode("utf-8-sig", errors="replace").strip()
+    entries: list[dict[str, Any]] = []
+    if "json" in content_type.lower() or decoded.startswith(("{", "[")):
+        try:
+            root = json.loads(decoded)
+        except json.JSONDecodeError as exc:
+            raise ValueError("A resposta JSON do feed está inválida.") from exc
+        records: Any = root
+        if isinstance(root, dict):
+            for key in ("items", "articles", "results", "data"):
+                if isinstance(root.get(key), list):
+                    records = root[key]
+                    break
+            else:
+                choices = root.get("choices")
+                if isinstance(choices, list) and choices:
+                    content = choices[0].get("message", {}).get("content", "") if isinstance(choices[0], dict) else ""
+                    records = [line.strip(" -*•\t") for line in str(content).splitlines() if line.strip(" -*•\t")]
+                elif any(key in root for key in ("title", "headline", "text", "content")):
+                    records = [root]
+        if not isinstance(records, list):
+            raise ValueError("O JSON precisa conter uma lista de notícias ou um campo de texto.")
+        for index, record in enumerate(records[:100]):
+            if isinstance(record, dict):
+                text = clean_ticker_text(record.get("title") or record.get("headline") or record.get("text") or record.get("content"))
+                external_id = str(record.get("id") or record.get("url") or record.get("link") or hashlib.sha256(text.encode()).hexdigest())
+                published_at = parse_ticker_published_at(
+                    next((record[key] for key in (
+                        "published_at", "published", "pubDate", "publication_date",
+                        "date", "created_at", "timestamp", "updated",
+                    ) if record.get(key) is not None), None)
+                )
+            else:
+                text = clean_ticker_text(record)
+                external_id = hashlib.sha256(text.encode()).hexdigest()
+                published_at = ""
+            if text:
+                entries.append({"external_id": external_id[:500], "text": text, "published_at": published_at})
+        return entries
+
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as exc:
+        raise ValueError("A resposta não é um feed RSS ou Atom válido.") from exc
+    candidates = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in ("item", "entry")]
+    for index, node in enumerate(candidates[:100]):
+        values = {child.tag.rsplit("}", 1)[-1].lower(): child for child in list(node)}
+        title = values.get("title")
+        link = values.get("link")
+        text = clean_ticker_text("".join(title.itertext()) if title is not None else "")
+        published_at = parse_ticker_published_at(next(
+            ("".join(values[field].itertext()) for field in
+             ("pubdate", "published", "date", "updated") if values.get(field) is not None),
+            None,
+        ))
+        external_id = ""
+        for field in ("guid", "id"):
+            if values.get(field) is not None:
+                external_id = clean_ticker_text("".join(values[field].itertext()))
+                break
+        if not external_id and link is not None:
+            external_id = str(link.attrib.get("href") or "".join(link.itertext())).strip()
+        if text:
+            entries.append({
+                "external_id": (external_id or hashlib.sha256(text.encode()).hexdigest())[:500],
+                "text": text,
+                "published_at": published_at,
+            })
+    return entries
+
+
+def validate_ticker_url(url: str, resolve: bool = False) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Informe um endereço RSS/Atom ou API JSON iniciado por http:// ou https://.")
+    if parsed.port not in (None, 80, 443):
+        raise ValueError("O feed deve usar a porta HTTP ou HTTPS padrão.")
+    host = parsed.hostname
+    addresses: list[str] = []
+    try:
+        addresses.append(str(ipaddress.ip_address(host)))
+    except ValueError:
+        if resolve:
+            addresses.extend(info[4][0] for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM))
+    for address in addresses:
+        if not ipaddress.ip_address(address).is_global:
+            raise ValueError("Feeds locais ou privados não são permitidos; use uma fonte pública.")
+    return url.strip()
+
+
+class PublicFeedRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: UrlRequest, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> UrlRequest | None:
+        validate_ticker_url(newurl, resolve=True)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def ticker_feed_snapshot(feed_id: int | None = None) -> list[dict[str, Any]]:
+    with db() as con:
+        if feed_id is None:
+            rows = con.execute("SELECT * FROM ticker_feeds ORDER BY id").fetchall()
+        else:
+            rows = con.execute("SELECT * FROM ticker_feeds WHERE id=?", (feed_id,)).fetchall()
+    output = []
+    for row in rows:
+        item = row_dict(row)
+        item["active"] = bool(item["active"])
+        item["has_token"] = bool(item.pop("api_token", ""))
+        output.append(item)
+    return output
+
+
+def ensure_default_ticker_feeds() -> None:
+    with db() as con:
+        for name, url, category in DEFAULT_TICKER_FEEDS:
+            existing = con.execute("SELECT id FROM ticker_feeds WHERE url=?", (url,)).fetchone()
+            if not existing:
+                con.execute(
+                    "INSERT INTO ticker_feeds(name,url,category) VALUES(?,?,?)",
+                    (name, url, category),
+                )
+
+
+def refresh_ticker_feed(feed_id: int) -> dict[str, Any]:
+    with db() as con:
+        row = con.execute("SELECT * FROM ticker_feeds WHERE id=?", (feed_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Fonte do ticker não encontrada.")
+    feed = row_dict(row)
+    try:
+        url = validate_ticker_url(feed["url"], resolve=True)
+        request = UrlRequest(url, headers={"User-Agent": "PlayoutTicker/1.0", "Accept": "application/rss+xml, application/atom+xml, application/feed+json, application/json, */*"})
+        if feed["api_token"]:
+            request.add_header("Authorization", f"Bearer {feed['api_token']}")
+        opener = build_opener(PublicFeedRedirectHandler())
+        with opener.open(request, timeout=15) as response:
+            payload = response.read(2_000_001)
+            content_type = response.headers.get("Content-Type", "")
+        if len(payload) > 2_000_000:
+            raise ValueError("A resposta da fonte ultrapassou 2 MB.")
+        entries = parse_ticker_payload(payload, content_type)
+        if not entries:
+            raise ValueError("A fonte não retornou manchetes reconhecidas.")
+        entries = ticker_fresh_entries(entries)
+        refreshed_at = local_now().isoformat(timespec="microseconds")
+        if not entries:
+            with db() as con:
+                con.execute("DELETE FROM ticker_items WHERE feed_id=?", (feed_id,))
+                con.execute(
+                    "UPDATE ticker_feeds SET updated_at=?,error='' WHERE id=?",
+                    (refreshed_at, feed_id),
+                )
+            prune_ticker_items()
+            return ticker_feed_snapshot(feed_id)[0]
+        for entry in entries:
+            with db() as con:
+                previous = con.execute(
+                    "SELECT text,original_text FROM ticker_items WHERE feed_id=? AND external_id=?",
+                    (feed_id, entry["external_id"]),
+                ).fetchone()
+            original_text = entry["text"]
+            if previous and previous["text"] and previous["original_text"] == original_text:
+                entry["text"] = previous["text"]
+            elif feed["category"] == "news":
+                entry["text"] = translate_ticker_news(entry["text"])
+            entry["original_text"] = original_text
+        with db() as con:
+            for order, entry in enumerate(entries):
+                con.execute("""INSERT INTO ticker_items(feed_id,external_id,text,category,source_name,active,sort_order,original_text,updated_at,published_at)
+                    VALUES(?,?,?,?,?,1,?,?,?,?) ON CONFLICT(feed_id,external_id) DO UPDATE SET
+                    text=excluded.text,category=excluded.category,source_name=excluded.source_name,
+                    sort_order=excluded.sort_order,original_text=excluded.original_text,
+                    updated_at=excluded.updated_at,published_at=excluded.published_at""",
+                    (feed_id, entry["external_id"], entry["text"], feed["category"], feed["name"],
+                     order, entry["original_text"], refreshed_at, entry["published_at"]))
+            external_ids = [entry["external_id"] for entry in entries]
+            placeholders = ",".join("?" for _ in external_ids)
+            con.execute(f"DELETE FROM ticker_items WHERE feed_id=? AND external_id NOT IN ({placeholders})",
+                        (feed_id, *external_ids))
+            con.execute("UPDATE ticker_feeds SET updated_at=?,error='' WHERE id=?",
+                        (refreshed_at, feed_id))
+        prune_ticker_items()
+    except Exception as exc:
+        with db() as con:
+            con.execute("UPDATE ticker_feeds SET updated_at=?,error=? WHERE id=?",
+                        (local_now().isoformat(timespec="seconds"), str(exc)[:500], feed_id))
+    return ticker_feed_snapshot(feed_id)[0]
+
+
+async def refresh_ticker_feeds() -> None:
+    for feed in ticker_feed_snapshot():
+        if feed["active"]:
+            await asyncio.to_thread(refresh_ticker_feed, int(feed["id"]))
+    prune_ticker_items()
+
+
+def prune_ticker_items(now: datetime | None = None) -> None:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = (current - TICKER_NEWS_RETENTION).isoformat(timespec="microseconds")
+    newest_allowed = (current + timedelta(minutes=5)).isoformat(timespec="microseconds")
+    max_items = get_ticker_config()["max_news_items"]
+    with db() as con:
+        con.execute(
+            """DELETE FROM ticker_items
+               WHERE feed_id IS NOT NULL AND
+               (published_at='' OR published_at < ? OR published_at > ?)""",
+            (cutoff, newest_allowed),
+        )
+        con.execute("""DELETE FROM ticker_items
+            WHERE feed_id IS NOT NULL AND id NOT IN (
+                SELECT id FROM ticker_items WHERE feed_id IS NOT NULL
+                ORDER BY updated_at DESC,id DESC LIMIT ?
+            )""", (max_items,))
 
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -979,21 +1523,39 @@ class TickerConfigIn(BaseModel):
     accent_color: str = Field(default="#34D399", pattern=r"^#[0-9A-Fa-f]{6}$")
     font_size: int = Field(default=24, ge=12, le=72)
     height: int = Field(default=72, ge=32, le=180)
-    speed_seconds: int = Field(default=32, ge=5, le=120)
+    speed_seconds: int = Field(default=90, ge=15, le=300)
     position: str = "bottom"
     prefix: str = Field(default="NOTÍCIAS", max_length=32)
     separator: str = Field(default="◆", max_length=8)
     opacity: int = Field(default=92, ge=20, le=100)
     show_source: bool = True
+    show_clock: bool = True
+    rotation_seconds: int = Field(default=10, ge=2, le=120)
+    max_news_items: int = Field(default=15, ge=5, le=20)
+
+
+TICKER_DEFAULTS = TickerConfigIn().model_dump()
 
 
 class TickerItemIn(BaseModel):
     text: str = Field(min_length=1, max_length=360)
     category: str = "general"
+    color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    image_data: str | None = Field(default=None, max_length=4_200_000)
 
 
 class TickerItemUpdateIn(BaseModel):
-    active: bool
+    active: bool | None = None
+    color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+
+
+class TickerWeatherCityIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    admin1: str = Field(default="", max_length=100)
+    country: str = Field(min_length=1, max_length=100)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    timezone: str = Field(default="auto", max_length=100)
 
 
 class TickerFeedIn(BaseModel):
@@ -1361,8 +1923,13 @@ engine = PlayoutEngine()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    ensure_default_ticker_feeds()
     scheduler = AsyncIOScheduler(timezone=BRAZIL_TZ)
     scheduler.add_job(engine.scheduler_tick, "interval", seconds=1, id="playout-clock", max_instances=1, coalesce=True)
+    scheduler.add_job(
+        refresh_ticker_feeds, "interval", minutes=15, jitter=180, id="ticker-refresh",
+        max_instances=1, coalesce=True, next_run_time=datetime.now(BRAZIL_TZ),
+    )
     scheduler.start()
     app.state.scheduler = scheduler
     yield
@@ -1386,6 +1953,263 @@ async def admin_page() -> FileResponse:
 @app.get("/player", response_class=HTMLResponse)
 async def player_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "player.html")
+
+
+@app.get("/ticker", response_class=HTMLResponse)
+async def ticker_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ticker.html")
+
+
+def ticker_items_for_program(program_category: str | None) -> list[dict[str, Any]]:
+    allowed = {"general"}
+    if program_category in TICKER_CATEGORIES:
+        allowed.add(program_category)
+    placeholders = ",".join("?" for _ in allowed)
+    with db() as con:
+        rows = con.execute(f"""SELECT i.id,i.text,i.category,i.source_name,i.active,i.sort_order,i.color,i.image_path
+            FROM ticker_items i LEFT JOIN ticker_feeds f ON f.id=i.feed_id
+            WHERE i.active=1 AND (i.feed_id IS NULL OR f.active=1)
+              AND i.category IN ({placeholders})
+            ORDER BY i.updated_at DESC,i.id DESC LIMIT ?""",
+            (*sorted(allowed), get_ticker_config()["max_news_items"])).fetchall()
+    return [ticker_item_output(row) for row in rows]
+
+
+def ticker_weather_cities_for_display() -> list[dict[str, Any]]:
+    selected_capitals = random.sample(BRAZIL_STATE_CAPITALS, 2)
+    random_city = random.choice(BRAZIL_RANDOM_WEATHER_CITIES)
+    selected = [
+        (f"capital-{state}", name, state, latitude, longitude)
+        for name, state, latitude, longitude in selected_capitals
+    ]
+    selected.append(
+        (f"random-{random_city[0]}", *random_city)
+    )
+    return [
+        {
+            "id": city_id,
+            "name": name,
+            "admin1": state,
+            "country": "Brasil",
+            "latitude": latitude,
+            "longitude": longitude,
+            "timezone": "auto",
+        }
+        for city_id, name, state, latitude, longitude in selected
+    ]
+
+
+async def ticker_weather_items() -> tuple[list[dict[str, Any]], str]:
+    if time.monotonic() - TICKER_WEATHER_CACHE["updated"] >= 300:
+        try:
+            cities = ticker_weather_cities_for_display()
+            items = await asyncio.to_thread(fetch_ticker_weather, cities)
+        except Exception as exc:
+            log.warning("Não foi possível atualizar o clima do ticker: %s", exc)
+            TICKER_WEATHER_CACHE.update(updated=time.monotonic(), error=str(exc)[:300])
+        else:
+            random.shuffle(items)
+            TICKER_WEATHER_CACHE.update(updated=time.monotonic(), items=items, error="")
+    return TICKER_WEATHER_CACHE["items"], TICKER_WEATHER_CACHE["error"]
+
+
+@app.get("/api/ticker/config")
+async def api_ticker_config() -> dict[str, Any]:
+    return get_ticker_config()
+
+
+@app.put("/api/ticker/config")
+async def update_ticker_config(payload: TickerConfigIn) -> dict[str, Any]:
+    if payload.position not in ("top", "bottom"):
+        raise HTTPException(400, "A posicao da faixa deve ser superior ou inferior.")
+    config = payload.model_dump()
+    set_setting("ticker_config", json.dumps(config, ensure_ascii=False))
+    return config
+
+
+@app.get("/api/ticker/state")
+async def api_ticker_state() -> dict[str, Any]:
+    config = get_ticker_config()
+    current = engine.current or {}
+    program_name = current.get("flow_program_name")
+    category = current.get("flow_program_category")
+    authorized = bool(config["enabled"] and current.get("ticker_enabled") and program_name)
+    items = ticker_items_for_program(category) if authorized else []
+    weather_error = ""
+    weather_items: list[dict[str, Any]] = []
+    if authorized:
+        weather_items, weather_error = await ticker_weather_items()
+    return {"config": config, "show": authorized and bool(items or weather_items or config["show_clock"]),
+            "program": program_name, "category": category or "general", "items": items,
+            "weather": weather_items, "weather_error": weather_error}
+
+
+@app.get("/api/ticker/items")
+async def api_ticker_items() -> list[dict[str, Any]]:
+    with db() as con:
+        rows = con.execute("SELECT id,text,category,source_name,active,sort_order,color,image_path,updated_at FROM ticker_items ORDER BY updated_at DESC,id DESC").fetchall()
+    return [ticker_item_output(row) for row in rows]
+
+
+@app.get("/api/ticker/images/{filename}")
+async def api_ticker_image(filename: str) -> FileResponse:
+    if Path(filename).name != filename or not re.fullmatch(r"[0-9a-f]{32}\.(?:png|jpg|gif|webp)", filename):
+        raise HTTPException(404, "Imagem do ticker não encontrada.")
+    image_path = DATA_DIR / "ticker_images" / filename
+    if not image_path.is_file():
+        raise HTTPException(404, "Imagem do ticker não encontrada.")
+    media_type = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}[image_path.suffix]
+    return FileResponse(image_path, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.post("/api/ticker/items")
+async def create_ticker_item(payload: TickerItemIn) -> dict[str, Any]:
+    category = payload.category.strip().lower()
+    if category not in TICKER_CATEGORIES:
+        raise HTTPException(400, "Escolha uma categoria valida para a mensagem.")
+    text = clean_ticker_text(payload.text)
+    if not text:
+        raise HTTPException(400, "Digite o texto da mensagem.")
+    if category == "news":
+        try:
+            text = await asyncio.to_thread(translate_ticker_news, text)
+        except Exception as exc:
+            log.warning("Não foi possível traduzir a notícia para pt-BR: %s", exc)
+            raise HTTPException(502, "Não foi possível traduzir a notícia para português do Brasil. Tente novamente.") from exc
+    image_path = save_ticker_image(payload.image_data)
+    with db() as con:
+        order = int(con.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM ticker_items").fetchone()[0])
+        cur = con.execute("INSERT INTO ticker_items(text,category,source_name,active,sort_order,color,image_path,updated_at) VALUES(?,?,?,1,?,?,?,?)",
+                          (text, category, "Manual", order, payload.color.upper(), image_path, local_now().isoformat(timespec="seconds")))
+        item_id = int(cur.lastrowid)
+        row = con.execute("SELECT id,text,category,source_name,active,sort_order,color,image_path,updated_at FROM ticker_items WHERE id=?", (item_id,)).fetchone()
+    return ticker_item_output(row)
+
+
+@app.put("/api/ticker/items/{item_id}")
+async def update_ticker_item(item_id: int, payload: TickerItemUpdateIn) -> dict[str, bool]:
+    updates = []
+    values: list[Any] = []
+    if payload.active is not None:
+        updates.append("active=?")
+        values.append(int(payload.active))
+    if payload.color is not None:
+        updates.append("color=?")
+        values.append(payload.color.upper())
+    if not updates:
+        raise HTTPException(400, "Informe ao menos um campo para atualizar.")
+    with db() as con:
+        cur = con.execute(f"UPDATE ticker_items SET {','.join(updates)} WHERE id=?", (*values, item_id))
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Mensagem do ticker nao encontrada.")
+    return {"ok": True}
+
+
+@app.delete("/api/ticker/items/{item_id}")
+async def delete_ticker_item(item_id: int) -> dict[str, bool]:
+    with db() as con:
+        row = con.execute("SELECT image_path FROM ticker_items WHERE id=?", (item_id,)).fetchone()
+        cur = con.execute("DELETE FROM ticker_items WHERE id=?", (item_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Mensagem do ticker nao encontrada.")
+    if row and row["image_path"]:
+        (DATA_DIR / "ticker_images" / row["image_path"]).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.get("/api/ticker/weather/search")
+async def search_ticker_weather(name: str) -> list[dict[str, Any]]:
+    query = name.strip()
+    if len(query) < 2 or len(query) > 100:
+        raise HTTPException(400, "Digite pelo menos 2 caracteres para buscar uma cidade.")
+    try:
+        return await asyncio.to_thread(weather_search_results, query)
+    except Exception as exc:
+        log.warning("Falha na busca de cidades para o clima: %s", exc)
+        raise HTTPException(502, "Não foi possível consultar a busca de cidades no Open-Meteo.") from exc
+
+
+@app.get("/api/ticker/weather/cities")
+async def api_ticker_weather_cities() -> list[dict[str, Any]]:
+    with db() as con:
+        rows = con.execute("SELECT id,name,admin1,country,latitude,longitude,timezone FROM ticker_weather_cities ORDER BY sort_order,id").fetchall()
+    return [row_dict(row) for row in rows]
+
+
+@app.post("/api/ticker/weather/cities")
+async def add_ticker_weather_city(payload: TickerWeatherCityIn) -> dict[str, Any]:
+    with db() as con:
+        count = int(con.execute("SELECT COUNT(*) FROM ticker_weather_cities").fetchone()[0])
+        if count >= 40:
+            raise HTTPException(400, "É possível acompanhar até 40 cidades.")
+        exists = con.execute(
+            "SELECT id FROM ticker_weather_cities WHERE ABS(latitude-?)<0.001 AND ABS(longitude-?)<0.001",
+            (payload.latitude, payload.longitude),
+        ).fetchone()
+        if exists:
+            raise HTTPException(409, "Essa cidade já está na lista do clima.")
+        order = int(con.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM ticker_weather_cities").fetchone()[0])
+        cur = con.execute(
+            "INSERT INTO ticker_weather_cities(name,admin1,country,latitude,longitude,timezone,sort_order) VALUES(?,?,?,?,?,?,?)",
+            (payload.name, payload.admin1, payload.country, payload.latitude, payload.longitude, payload.timezone, order),
+        )
+        row = con.execute("SELECT id,name,admin1,country,latitude,longitude,timezone FROM ticker_weather_cities WHERE id=?", (cur.lastrowid,)).fetchone()
+    TICKER_WEATHER_CACHE.update(updated=0.0, items=[], error="")
+    return row_dict(row)
+
+
+@app.delete("/api/ticker/weather/cities/{city_id}")
+async def remove_ticker_weather_city(city_id: int) -> dict[str, bool]:
+    with db() as con:
+        cur = con.execute("DELETE FROM ticker_weather_cities WHERE id=?", (city_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Cidade não encontrada na lista do clima.")
+    TICKER_WEATHER_CACHE.update(updated=0.0, items=[], error="")
+    return {"ok": True}
+
+
+@app.get("/api/ticker/feeds")
+async def api_ticker_feeds() -> list[dict[str, Any]]:
+    return ticker_feed_snapshot()
+
+
+@app.post("/api/ticker/feeds")
+async def create_ticker_feed(payload: TickerFeedIn) -> dict[str, Any]:
+    category = payload.category.strip().lower()
+    if category not in TICKER_CATEGORIES:
+        raise HTTPException(400, "Escolha uma categoria válida para a fonte.")
+    try:
+        url = validate_ticker_url(payload.url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with db() as con:
+        cur = con.execute("INSERT INTO ticker_feeds(name,url,api_token,category) VALUES(?,?,?,?)",
+                          (payload.name.strip(), url, payload.api_token.strip(), category))
+        feed_id = int(cur.lastrowid)
+    return await asyncio.to_thread(refresh_ticker_feed, feed_id)
+
+
+@app.put("/api/ticker/feeds/{feed_id}")
+async def update_ticker_feed(feed_id: int, payload: TickerFeedUpdateIn) -> dict[str, bool]:
+    with db() as con:
+        cur = con.execute("UPDATE ticker_feeds SET active=? WHERE id=?", (int(payload.active), feed_id))
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Fonte do ticker nao encontrada.")
+    return {"ok": True}
+
+
+@app.delete("/api/ticker/feeds/{feed_id}")
+async def delete_ticker_feed(feed_id: int) -> dict[str, bool]:
+    with db() as con:
+        cur = con.execute("DELETE FROM ticker_feeds WHERE id=?", (feed_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Fonte do ticker nao encontrada.")
+    return {"ok": True}
+
+
+@app.post("/api/ticker/feeds/{feed_id}/refresh")
+async def refresh_one_ticker_feed(feed_id: int) -> dict[str, Any]:
+    return await asyncio.to_thread(refresh_ticker_feed, feed_id)
 
 
 @app.get("/api/library")
@@ -1522,10 +2346,10 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
                 WHERE id=?""", (flow_name, payload.mode, int(payload.recursive), payload.program_share,
                                  payload.ad_break_seconds, global_jingle_id,
                                  global_commercial_id, flow_id))
-            old_rows = con.execute("SELECT folder_id,active FROM flow_programs WHERE flow_id=? ORDER BY sort_order",
+            old_rows = con.execute("SELECT folder_id,active,duration_seconds,content_type,ticker_enabled FROM flow_programs WHERE flow_id=? ORDER BY sort_order",
                                    (flow_id,)).fetchall()
             old_order = [int(r["folder_id"]) for r in old_rows]
-            old_active = {int(r["folder_id"]): int(r["active"]) for r in old_rows}
+            old_program_settings = {int(r["folder_id"]): dict(r) for r in old_rows}
         else:
             cur = con.execute("""INSERT INTO flows(name,root_path,mode,recursive,program_share,ad_break_seconds,jingle_folder_id,commercial_folder_id)
                 VALUES(?,?,?,?,?,?,?,?)""", (flow_name, str(root), payload.mode, int(payload.recursive), payload.program_share,
@@ -1533,7 +2357,7 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
                                            global_jingle_id, global_commercial_id))
             flow_id = int(cur.lastrowid)
             old_order = []
-            old_active = {}
+            old_program_settings = {}
     discovered = []
     for path in program_paths:
         discovered.append(await asyncio.to_thread(create_flow_program, flow_name, path,
@@ -1546,9 +2370,12 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
         con.execute("DELETE FROM flow_programs WHERE flow_id=?", (flow_id,))
         for order, folder_id in enumerate(ordered_ids):
             item = by_id[folder_id]
-            con.execute("""INSERT INTO flow_programs(flow_id,folder_id,jingle_folder_id,commercial_folder_id,sort_order,active)
-                VALUES(?,?,?,?,?,?)""", (flow_id, folder_id, item["jingle_folder_id"],
-                                         item["commercial_folder_id"], order, old_active.get(folder_id, 1)))
+            saved = old_program_settings.get(folder_id, {})
+            con.execute("""INSERT INTO flow_programs(flow_id,folder_id,jingle_folder_id,commercial_folder_id,sort_order,active,
+                duration_seconds,content_type,ticker_enabled) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (flow_id, folder_id, item["jingle_folder_id"], item["commercial_folder_id"], order,
+                 saved.get("active", 1), saved.get("duration_seconds", 0),
+                 saved.get("content_type", "general"), saved.get("ticker_enabled", 0)))
     await engine.publish()
     return flow_snapshot(flow_id)
 
