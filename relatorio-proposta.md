@@ -1,87 +1,35 @@
-# Relatório de proposta — Sistema de playout para OBS
+# Relatório de melhorias — Sistema de playout para OBS
 
-**Status:** aprovado pelo usu?rio; implementa??o validada em teste automatizado isolado em 14/11/2026. O teste n?o incluiu opera??o real no OBS.
+**Status:** implementação concluída após aprovação do usuário. Os testes automatizados passaram em 14/11/2026. A reprodução real no OBS ainda depende de reiniciar o servidor e validar no computador da emissora.
 
-## 1. Objetivo
+## Melhorias incluídas
 
-Criar um programa local para organizar e automatizar a reprodução de vídeos e áudios usados em uma programação de rádio/TV, com uma tela de operação e uma saída de reprodução que possa ser adicionada ao OBS Studio como Fonte de Navegador.
+- A grade aceita eventos recorrentes por dia da semana e eventos pontuais em uma data escolhida.
+- Cada programa do fluxo agora tem um botão **Agendar** que abre o formulário já ligado àquele programa; o bloco toca só esse programa e seus próprios intervalos.
+- O painel mostra a programação de hoje, o bloco seguinte e a contagem regressiva até o próximo horário.
+- O operador pode definir o tempo do intervalo comercial. Se deixar em zero, o sistema distribui os anúncios pela proporção de tempo configurada, como 90/10.
+- O player avança automaticamente quando um arquivo falha. Também detecta uma mídia que parou de avançar por 15 segundos e tenta seguir para o próximo item.
+- A leitura de pastas roda em segundo plano, mostra o progresso e permite cancelar. Arquivos que o FFprobe não consegue abrir aparecem com o motivo.
+- O painel oferece o download de uma cópia do banco. O sistema mantém até 20 cópias criadas pelo recurso de backup.
+- As conexões do banco SQLite agora são fechadas corretamente após cada operação.
+- Foram adicionados testes persistentes para importação de pastas, categorias, intervalos, grade, agendamento individual de programa, conflitos, início automático, avanço do player, leitura e backup.
 
-Neste projeto, “leitura” significa carregar e reproduzir os arquivos de mídia. O `inicio.md` não descreve transcrição, teleprompter ou leitura de texto por voz; essas funções não fazem parte desta proposta.
+## Verificações executadas
 
-## 2. O que o programa permitirá fazer
+Comando executado:
 
-- Cadastrar pastas locais e identificar arquivos `.mp4`, `.webm`, `.mov`, `.mp3`, `.wav` e `.ogg`, com duração e tipo de mídia.
-- Escolher pastas e arquivos específicos em seletores nativos do Windows, sem depender de digitar caminhos.
-- Selecionar uma pasta raiz que contenha todos os programas; salvar nela o banco e as configurações do playout.
-- Organizar arquivos em programas ou blocos, alterar a ordem, ativar/desativar itens e configurar reprodução única, repetição limitada ou loop.
-- Criar uma grade semanal com dia, hora de início e fim, duração/limite opcional e modo de transição: corte na hora marcada ou espera pelo fim da mídia atual.
-- Criar blocos de comerciais com duração prevista e uma sequência própria de anúncios, vinhetas ou outros arquivos.
-- Reunir no mesmo programa arquivos de várias pastas e identificar categorias de música, vinheta, patrocinador e comercial, com inserção configurável a cada quantidade de músicas.
-- Importar uma raiz com vários programas, vídeos e bibliotecas de vinhetas/comerciais próprias ou compartilhadas; organizar a ordem dos programas e distribuir o tempo com proporção-alvo 90/10.
-- Criar pastas de programa e importar arquivos escolhidos pelo operador, copiando-os para as pastas de Vídeos, Vinhetas e Comerciais correspondentes.
-- Repetir a sequência do programa durante o horário agendado, recomeçando a fila se os arquivos terminarem antes do horário final.
-- Acompanhar no painel o relógio, o conteúdo no ar, o progresso e o estado da automação; iniciar, pausar, avançar ou parar a reprodução.
-- Escolher execução sequencial ou aleatória por programa, avançar automaticamente após cada arquivo e exibir a duração total das mídias e a duração reservada para programas e comerciais.
-- Reproduzir a programação na rota `/player`, em tela cheia e sem controles visíveis, para uso como Browser Source no OBS. Áudios podem manter uma imagem de fundo ou logotipo.
-- Salvar a biblioteca e a programação localmente para continuar disponíveis ao reiniciar o programa.
+```text
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-## 3. Fluxo de uso proposto
+Resultado: **7 testes passaram**. As páginas `static/admin.html` e `static/player.html` também passaram na verificação de sintaxe JavaScript com Node.js.
 
-1. O operador cadastra uma pasta e importa suas mídias.
-2. Organiza as mídias em programas/blocos e define ordem, repetição e limites.
-3. Monta a grade semanal, incluindo os horários de comerciais.
-4. Inicia o motor e confere o conteúdo atual pelo painel `/admin`.
-5. Adiciona `http://localhost:8000/player` como Fonte de Navegador no OBS.
+Os testes usaram uma pasta temporária e arquivos de áudio gerados para esse fim. A pasta de mídia da emissora não foi alterada. A validação não incluiu uma transmissão real no OBS.
 
-## 4. Componentes e tecnologias
+## Para aplicar no servidor que já está aberto
 
-- **Servidor e motor:** Python 3.10+, FastAPI e Uvicorn.
-- **Dados:** SQLite para biblioteca, programas, itens, configurações e grade.
-- **Agendamento e comunicação:** APScheduler e WebSockets para enviar atualizações e comandos ao player.
-- **Leitura de duração:** FFprobe, por atender áudio e vídeo. Será necessário instalá-lo ou incluí-lo/configurá-lo junto ao sistema.
-- **Interface:** HTML, JavaScript e TailwindCSS, com painel `/admin` e player `/player`.
-- **Inicialização no Windows:** arquivo `.bat` e instruções de configuração do OBS.
+O servidor em execução carregou a versão anterior do código. As mudanças serão carregadas quando ele for reiniciado. Como o player estava pausado, não reiniciei o processo para evitar perder o ponto atual da reprodução. Depois que a reprodução puder ser interrompida, feche a janela do servidor e abra `iniciar_sistema.bat` novamente; a programação e os arquivos da emissora permanecem salvos em `.playout`.
 
-## 5. Regras operacionais propostas
+## Limites
 
-- O sistema usa o relógio e o fuso horário configurados no computador.
-- Eventos sobrepostos na grade serão sinalizados e não poderão ser ativados até o conflito ser resolvido.
-- O horário final do bloco encerra a reprodução daquele bloco; um evento seguinte pode começar conforme a regra de corte ou espera configurada.
-- Um intervalo comercial terá duração-alvo. A proposta é tocar os anúncios em sequência e, ao atingir o limite do intervalo, seguir a grade; isso pode cortar um anúncio que ultrapasse o horário. Se o intervalo terminar antes do limite, o sistema pode tocar uma vinheta ou imagem/áudio de espera até o próximo bloco.
-- A interface informará quando uma pasta ou arquivo não estiver mais acessível, para que o operador possa corrigir o caminho ou reimportar a pasta.
-- A saída do player depende do OBS manter a Fonte de Navegador ativa e de o navegador permitir iniciar o áudio. A primeira reprodução pode exigir um clique de ativação, conforme o próprio guia.
-
-## 6. Etapas de implementação sugeridas
-
-1. Estrutura do projeto, banco SQLite e importação/varredura de pastas.
-2. Player web para OBS e controles de reprodução, fila e repetição.
-3. Grade semanal, blocos de programas, limites de tempo e transições.
-4. Intervalos comerciais e gestão da sequência de anúncios.
-5. Painel operacional, inicializador do Windows e instruções de uso.
-6. Revisão dos requisitos do `inicio.md` e dos requisitos de comerciais antes de considerar o sistema pronto para operação.
-
-## 7. Pontos para aprovação
-
-1. **Comerciais:** aplicar duração-alvo e encerrar um anúncio no fim do intervalo.
-2. **Leitura de pastas:** incluir subpastas na varredura, com opção para desativar esse comportamento.
-3. **Uso inicial:** considerar um computador Windows com OBS local.
-
-## 8. Limites desta proposta
-
-O desenho é para playout local integrado ao OBS. O guia não especifica redundância de servidor, operação remota, distribuição de sinal ou garantias de disponibilidade de uma emissora de transmissão contínua. Também será necessário validar no ambiente real os codecs dos arquivos e as configurações de áudio/vídeo do OBS.
-
-## 9. Base consultada
-
-Proposta elaborada a partir do [inicio.md](inicio.md) e do pedido de incluir organização de programas, sequência/duração e espaços para comerciais.
-
-## 10. Valida??o automatizada
-
-Em 14/11/2026, a aplica??o foi iniciada em uma porta local tempor?ria e testada com arquivos de m?dia de exemplo, usando uma pasta tempor?ria separada dos dados da emissora. Todos os cen?rios abaixo passaram:
-
-- Criar um fluxo em uma raiz vazia e criar as pastas V?deos, Vinhetas e Comerciais.
-- Copiar e registrar os arquivos selecionados, reconhecer as pastas no plural e ocultar pastas internas da lista de programas avulsos.
-- Gerar a fila com an?ncios sequenciais na propor??o-alvo 90/10.
-- Salvar um hor?rio, iniciar o fluxo pelo agendador e rejeitar conflitos de hor?rio.
-- Entregar m?dia ao player, avan?ar pelo evento `ended` mesmo depois de uma pausa e validar a sintaxe JavaScript das duas p?ginas.
-
-A verifica??o confirma as rotas e a l?gica local do aplicativo. A apar?ncia e o ?udio de uma transmiss?o real no OBS ainda dependem de valida??o no computador da emissora.
+O player usa o navegador embutido no OBS e os codecs disponíveis no computador. O watchdog pula uma mídia sem avanço por 15 segundos quando o player informa que está reproduzindo. Confirme no OBS os formatos e a saída de áudio da emissora antes de deixar a grade operando sem supervisão.

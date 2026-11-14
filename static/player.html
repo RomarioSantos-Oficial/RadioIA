@@ -21,7 +21,7 @@
   </main>
 <script>
 const video=document.getElementById('media'),backdrop=document.getElementById('backdrop'),notice=document.getElementById('notice'),activate=document.getElementById('activate');
-let ws=null,lastToken=-1,activeState='stopped',wantPosition=0,allowPlayback=false,retryTimer=null,noticeTimer=null;
+let ws=null,lastToken=-1,activeState='stopped',wantPosition=0,allowPlayback=false,retryTimer=null,noticeTimer=null,lastPlaybackPosition=0,lastPlaybackAdvance=Date.now(),errorSentToken=-1;
 function showNotice(message,temporary=false){notice.textContent=message;notice.classList.add('show');if(temporary){clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>notice.classList.remove('show'),2600)}}
 function send(payload){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify(payload))}
 function setBackground(url){backdrop.style.backgroundImage=url?`url("${url}")`:''}
@@ -32,17 +32,18 @@ function applyState(s){
   activeState=s.state||'stopped';
   if(!s.current){if(video.src){video.pause();video.removeAttribute('src');video.load()}lastToken=s.token??lastToken;activate.classList.remove('visible');if(s.message)showNotice(s.message,true);return}
   setAudioVisual(s.current);
-  if(s.token!==lastToken){lastToken=s.token;wantPosition=Number(s.position||0);video.pause();video.src=`/media/${s.current.id}?play=${s.token}`;video.load();video.onloadedmetadata=async()=>{if(wantPosition>0&&Number.isFinite(video.duration))try{video.currentTime=Math.min(wantPosition,Math.max(0,video.duration-.25))}catch{}if(activeState==='playing')await attemptPlay()};video.onerror=()=>{send({type:'player-error',token:lastToken});showNotice('Arquivo indisponível ou formato não suportado. Confira no painel.')}}
+  if(s.token!==lastToken){lastToken=s.token;errorSentToken=-1;lastPlaybackPosition=0;lastPlaybackAdvance=Date.now();wantPosition=Number(s.position||0);video.pause();video.src=`/media/${s.current.id}?play=${s.token}`;video.load();video.onloadedmetadata=async()=>{if(wantPosition>0&&Number.isFinite(video.duration))try{video.currentTime=Math.min(wantPosition,Math.max(0,video.duration-.25))}catch{}if(activeState==='playing')await attemptPlay()};video.onerror=()=>reportPlayerError('Arquivo indisponível ou formato não suportado. Confira no painel.')}
   if(activeState==='paused'){video.pause();activate.classList.remove('visible')}
   else if(activeState==='playing'&&video.paused&&!video.ended&&video.readyState>=2)attemptPlay();
   if(s.message&&s.state!=='playing')showNotice(s.message,true);
 }
 function connect(){clearTimeout(retryTimer);const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(`${proto}://${location.host}/ws`);ws.onopen=()=>{notice.classList.remove('show');if(video.ended&&activeState==='playing')send({type:'ended',token:lastToken})};ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='state')applyState(m);else if(m.type==='command'){if(m.command==='pause')video.pause();if(m.command==='resume')attemptPlay()}}catch{}};ws.onclose=()=>{showNotice('Reconectando ao motor…');retryTimer=setTimeout(connect,1200)};ws.onerror=()=>ws.close()}
+function reportPlayerError(message){if(lastToken<0||errorSentToken===lastToken)return;errorSentToken=lastToken;send({type:'player-error',token:lastToken});showNotice(message,true)}
 document.getElementById('activateButton').addEventListener('click',async()=>{allowPlayback=true;try{await video.play();activate.classList.remove('visible')}catch{showNotice('O navegador não conseguiu reproduzir este arquivo.')}});
 video.addEventListener('ended',()=>send({type:'ended',token:lastToken}));
 video.addEventListener('playing',()=>{activeState='playing';activate.classList.remove('visible')});
-video.addEventListener('error',()=>{if(video.currentSrc){send({type:'player-error',token:lastToken});showNotice('Erro ao carregar o arquivo.')}});
-setInterval(()=>{if(video.src&&!video.ended)send({type:'progress',token:lastToken,position:video.currentTime||0})},900);
+video.addEventListener('error',()=>{if(video.currentSrc)reportPlayerError('Erro ao carregar o arquivo; pulando para o próximo.')});
+setInterval(()=>{if(video.src&&!video.ended){const position=video.currentTime||0;if(Math.abs(position-lastPlaybackPosition)>.25){lastPlaybackPosition=position;lastPlaybackAdvance=Date.now()}send({type:'progress',token:lastToken,position});if(activeState==='playing'&&!video.paused&&video.readyState>=2&&!video.seeking&&Date.now()-lastPlaybackAdvance>15000)reportPlayerError('A mídia parou de avançar; pulando para o próximo arquivo.')}},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&activeState==='playing'&&video.paused&&!video.ended)attemptPlay()});
 connect();
 </script>

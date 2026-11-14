@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import ipaddress
 import json
 import logging
 import os
 import random
+import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import threading
 import time
 import unicodedata
-from contextlib import asynccontextmanager
-from datetime import datetime, time as clock_time, timedelta
+from contextlib import asynccontextmanager, contextmanager
+from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+from threading import Event, Lock
+from uuid import uuid4
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -31,8 +41,13 @@ WORKSPACE_POINTER = DATA_DIR / "workspace.json"
 SUPPORTED = {".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg"}
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 WEEKDAYS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("playout")
+SCAN_JOBS: dict[str, dict[str, Any]] = {}
+SCAN_CANCELLATIONS: dict[str, Event] = {}
+SCAN_LOCK = Lock()
+SCAN_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def load_workspace_pointer() -> None:
@@ -49,13 +64,21 @@ def load_workspace_pointer() -> None:
 load_workspace_pointer()
 
 
-def db() -> sqlite3.Connection:
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA journal_mode=WAL")
-    return con
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def init_db() -> None:
@@ -93,6 +116,7 @@ def init_db() -> None:
             mode TEXT NOT NULL DEFAULT 'sequential',
             recursive INTEGER NOT NULL DEFAULT 1,
             program_share INTEGER NOT NULL DEFAULT 90,
+            ad_break_seconds INTEGER NOT NULL DEFAULT 0,
             jingle_folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             commercial_folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
         );
@@ -103,6 +127,9 @@ def init_db() -> None:
             commercial_folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
+            duration_seconds INTEGER NOT NULL DEFAULT 0,
+            content_type TEXT NOT NULL DEFAULT 'general',
+            ticker_enabled INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(flow_id, folder_id)
         );
         CREATE TABLE IF NOT EXISTS schedules (
@@ -112,6 +139,7 @@ def init_db() -> None:
             flow_id INTEGER REFERENCES flows(id) ON DELETE SET NULL,
             kind TEXT NOT NULL DEFAULT 'program',
             weekdays TEXT NOT NULL,
+            schedule_date TEXT,
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
             transition TEXT NOT NULL DEFAULT 'cut',
@@ -120,6 +148,27 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ticker_feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            api_token TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'news',
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS ticker_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER REFERENCES ticker_feeds(id) ON DELETE CASCADE,
+            external_id TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            source_name TEXT NOT NULL DEFAULT 'Manual',
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(feed_id,external_id)
         );
         INSERT OR IGNORE INTO settings(key,value) VALUES('automation','0');
         INSERT OR IGNORE INTO settings(key,value) VALUES('background_path','');
@@ -173,9 +222,20 @@ def init_db() -> None:
             con.execute("ALTER TABLE flow_programs ADD COLUMN commercial_folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL")
         if "active" not in program_columns:
             con.execute("ALTER TABLE flow_programs ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        if "duration_seconds" not in program_columns:
+            con.execute("ALTER TABLE flow_programs ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
+        if "content_type" not in program_columns:
+            con.execute("ALTER TABLE flow_programs ADD COLUMN content_type TEXT NOT NULL DEFAULT 'general'")
+        if "ticker_enabled" not in program_columns:
+            con.execute("ALTER TABLE flow_programs ADD COLUMN ticker_enabled INTEGER NOT NULL DEFAULT 0")
         flow_columns = {row["name"] for row in con.execute("PRAGMA table_info(flows)")}
         if "recursive" not in flow_columns:
             con.execute("ALTER TABLE flows ADD COLUMN recursive INTEGER NOT NULL DEFAULT 1")
+        if "ad_break_seconds" not in flow_columns:
+            con.execute("ALTER TABLE flows ADD COLUMN ad_break_seconds INTEGER NOT NULL DEFAULT 0")
+        schedule_columns = {row["name"] for row in con.execute("PRAGMA table_info(schedules)")}
+        if "schedule_date" not in schedule_columns:
+            con.execute("ALTER TABLE schedules ADD COLUMN schedule_date TEXT")
 
 
 def switch_workspace(root: Path) -> None:
@@ -188,13 +248,38 @@ def switch_workspace(root: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     old_db = DB_PATH
     if target_db.resolve() != old_db.resolve() and not target_db.exists() and old_db.exists():
-        with sqlite3.connect(old_db) as source, sqlite3.connect(target_db) as destination:
+        source = sqlite3.connect(old_db, timeout=15)
+        destination = sqlite3.connect(target_db, timeout=15)
+        try:
             source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
     DATA_DIR = target_dir
     DB_PATH = target_db
     init_db()
     WORKSPACE_POINTER.parent.mkdir(parents=True, exist_ok=True)
     WORKSPACE_POINTER.write_text(json.dumps({"path": str(root)}, ensure_ascii=False), encoding="utf-8")
+
+
+def create_database_backup() -> Path | None:
+    if not DB_PATH.is_file():
+        return None
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    destination = backup_dir / f"playout-{stamp}.sqlite3"
+    source_con = sqlite3.connect(DB_PATH, timeout=15)
+    backup_con = sqlite3.connect(destination, timeout=15)
+    try:
+        source_con.backup(backup_con)
+    finally:
+        backup_con.close()
+        source_con.close()
+    backups = sorted(backup_dir.glob("playout-*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[20:]:
+        old.unlink(missing_ok=True)
+    return destination
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -348,34 +433,53 @@ def add_file(folder_id: int, path_text: str, order: int | None = None,
     return True
 
 
-def folder_scan(folder_id: int) -> tuple[int, int]:
+def folder_scan_report(folder_id: int, progress: Callable[[int, int, str, int, int], None] | None = None,
+                      cancel: Event | None = None) -> dict[str, Any]:
     folder = get_folder(folder_id)
     root = Path(folder["path"]).resolve()
     if not root.is_dir():
         raise HTTPException(400, "A pasta selecionada não está acessível.")
     iterator = root.rglob("*") if folder["recursive"] else root.iterdir()
     paths = sorted((p for p in iterator if p.is_file() and p.suffix.lower() in SUPPORTED), key=lambda p: str(p).casefold())
-    present = {os.path.normcase(str(path.resolve())) for path in paths}
+    present: set[str] = set()
     added = 0
-    for path in paths:
+    invalid: list[dict[str, str]] = []
+    scanned = 0
+    cancelled = False
+    for index, path in enumerate(paths, start=1):
+        if cancel and cancel.is_set():
+            cancelled = True
+            break
+        present.add(os.path.normcase(str(path.resolve())))
+        scanned = index
         if add_file(folder_id, str(path), source_root=root):
             added += 1
-    # Remove da biblioteca arquivos apagados ou movidos para fora da pasta.
-    # Mídias selecionadas manualmente de outros diretórios são preservadas.
-    with db() as con:
-        rows = con.execute("SELECT id,path FROM media WHERE folder_id=?", (folder_id,)).fetchall()
-        stale_ids = []
-        for row in rows:
-            media_path = Path(row["path"]).resolve()
-            try:
-                media_path.relative_to(root)
-            except ValueError:
-                continue
-            if os.path.normcase(str(media_path)) not in present:
-                stale_ids.append((row["id"],))
-        if stale_ids:
-            con.executemany("DELETE FROM media WHERE id=?", stale_ids)
-    return added, len(paths)
+        else:
+            invalid.append({"name": path.name, "reason": "O FFprobe não conseguiu ler o arquivo ou sua duração."})
+        if progress:
+            progress(index, len(paths), path.name, added, len(invalid))
+    # Keep manually imported files, and only remove stale folder files after a full scan.
+    if not cancelled:
+        with db() as con:
+            rows = con.execute("SELECT id,path FROM media WHERE folder_id=?", (folder_id,)).fetchall()
+            stale_ids = []
+            for row in rows:
+                media_path = Path(row["path"]).resolve()
+                try:
+                    media_path.relative_to(root)
+                except ValueError:
+                    continue
+                if os.path.normcase(str(media_path)) not in present:
+                    stale_ids.append((row["id"],))
+            if stale_ids:
+                con.executemany("DELETE FROM media WHERE id=?", stale_ids)
+    return {"added": added, "found": len(paths), "scanned": scanned,
+            "invalid": invalid, "cancelled": cancelled}
+
+
+def folder_scan(folder_id: int) -> tuple[int, int]:
+    result = folder_scan_report(folder_id)
+    return int(result["added"]), int(result["found"])
 
 
 def list_library() -> list[dict[str, Any]]:
@@ -409,8 +513,9 @@ def as_seconds(hhmm: str) -> int:
 
 
 def event_datetime(event: dict[str, Any], day: datetime) -> tuple[datetime, datetime]:
-    start = datetime.combine(day.date(), clock_time.fromisoformat(event["start_time"])).astimezone()
-    end = datetime.combine(day.date(), clock_time.fromisoformat(event["end_time"])).astimezone()
+    event_day = date.fromisoformat(event["schedule_date"]) if event.get("schedule_date") else day.date()
+    start = datetime.combine(event_day, clock_time.fromisoformat(event["start_time"]), tzinfo=BRAZIL_TZ)
+    end = datetime.combine(event_day, clock_time.fromisoformat(event["end_time"]), tzinfo=BRAZIL_TZ)
     if end <= start:
         end += timedelta(days=1)
     return start, end
@@ -418,13 +523,24 @@ def event_datetime(event: dict[str, Any], day: datetime) -> tuple[datetime, date
 
 def scheduled_events() -> list[dict[str, Any]]:
     with db() as con:
-        rows = con.execute("""SELECT s.*,COALESCE(fl.name,f.name) AS folder_name FROM schedules s
+        rows = con.execute("""SELECT s.*,f.path AS _folder_path,
+            CASE WHEN s.kind='flow_program' THEN f.name ELSE COALESCE(fl.name,f.name) END AS folder_name FROM schedules s
             JOIN folders f ON f.id=s.folder_id LEFT JOIN flows fl ON fl.id=s.flow_id
             ORDER BY s.start_time,s.id""").fetchall()
     output = [row_dict(r) for r in rows]
     for event in output:
         event["weekdays"] = [int(d) for d in event["weekdays"].split(",") if d != ""]
         event["active"] = bool(event["active"])
+        if event["kind"] == "flow_program":
+            source_path = Path(event.pop("_folder_path"))
+            if directory_role(source_path.name) == "videos":
+                event["folder_name"] = source_path.parent.name
+            else:
+                _, separator, program_name = str(event["folder_name"]).rpartition(" · ")
+                if separator:
+                    event["folder_name"] = program_name
+        else:
+            event.pop("_folder_path", None)
     return output
 
 
@@ -476,6 +592,14 @@ def get_flow_programs(flow_id: int) -> list[dict[str, Any]]:
     output = [row_dict(row) for row in rows]
     for item in output:
         item["active"] = bool(item["active"])
+        item["ticker_enabled"] = bool(item.get("ticker_enabled", 0))
+        source_path = Path(item["path"])
+        if directory_role(source_path.name) == "videos":
+            item["name"] = source_path.parent.name
+        else:
+            _, separator, program_name = str(item["name"]).rpartition(" · ")
+            if separator:
+                item["name"] = program_name
     return output
 
 
@@ -487,10 +611,12 @@ def flow_snapshot(flow_id: int) -> dict[str, Any]:
     ad_duration = 0.0
     cycle_estimate = 0.0
     for item in get_flow_programs(flow_id):
+        configured_seconds = int(item.get("duration_seconds", 0) or 0)
         if not item["active"]:
             programs.append({**item, "media_count": 0, "duration": 0.0,
                              "jingle_count": 0, "jingle_duration": 0.0,
-                             "commercial_count": 0, "commercial_duration": 0.0})
+                             "commercial_count": 0, "commercial_duration": 0.0,
+                             "estimated_block_seconds": configured_seconds})
             continue
         media = get_folder_media(int(item["folder_id"]), active_only=True)
         duration = sum(float(m["duration"]) for m in media)
@@ -502,21 +628,30 @@ def flow_snapshot(flow_id: int) -> dict[str, Any]:
         jingle_duration = sum(float(m["duration"]) for m in jingles)
         commercial_duration = sum(float(m["duration"]) for m in commercials)
         ad_duration += jingle_duration + commercial_duration
-        cycle_estimate += duration * 100 / int(flow["program_share"]) if (jingle_duration + commercial_duration) and int(flow["program_share"]) < 100 else duration
+        estimated_queue, _, _ = build_flow_queue(flow_id, program_folder_id=int(item["folder_id"]))
+        estimated_seconds = sum(float(media_item["duration"]) for media_item in estimated_queue)
+        cycle_estimate += estimated_seconds
         programs.append({**item, "media_count": len(media), "duration": duration,
                          "jingle_count": len(jingles), "jingle_duration": jingle_duration,
-                         "commercial_count": len(commercials), "commercial_duration": commercial_duration})
+                         "commercial_count": len(commercials), "commercial_duration": commercial_duration,
+                         "estimated_block_seconds": configured_seconds or estimated_seconds})
     return {**flow, "programs": programs, "program_duration": program_duration,
             "interstitial_duration": ad_duration, "media_duration": program_duration + ad_duration,
             "cycle_duration_estimate": cycle_estimate}
 
 
-def build_flow_queue(flow_id: int, ad_cursor: int = 0) -> tuple[list[dict[str, Any]], int]:
+def build_flow_queue(flow_id: int, ad_cursor: int = 0,
+                     program_progress: float = 0.0,
+                     program_folder_id: int | None = None) -> tuple[list[dict[str, Any]], int, float]:
     flow = get_flow(flow_id)
     share = max(50, min(100, int(flow["program_share"])))
+    ad_break_seconds = max(0, int(flow.get("ad_break_seconds", 0) or 0))
     queue: list[dict[str, Any]] = []
+    carried_program_seconds = max(0.0, float(program_progress))
     for program in get_flow_programs(flow_id):
-        if not program["active"]:
+        if program_folder_id is not None and int(program["folder_id"]) != program_folder_id:
+            continue
+        if not program["active"] and program_folder_id is None:
             continue
         program_media = get_folder_media(int(program["folder_id"]), active_only=True)
         if flow["mode"] == "random":
@@ -527,10 +662,38 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0) -> tuple[list[dict[str, A
         jingles = get_folder_media(int(jingle_id), active_only=True) if jingle_id else []
         commercials = get_folder_media(int(commercial_id), active_only=True) if commercial_id else []
         ad_media = [dict(m, loop_mode="once", repeat_count=1) for m in (*jingles, *commercials)]
+        ticker_tags = {"flow_program_folder_id": int(program["folder_id"]),
+                       "flow_program_category": program.get("content_type", "general"),
+                       "flow_program_name": program.get("name", ""),
+                       "ticker_enabled": bool(program.get("ticker_enabled", False))}
+        if ad_break_seconds:
+            interval_seconds = ad_break_seconds * share / max(1, 100 - share) if share < 100 else float("inf")
+            program_since_break = carried_program_seconds
+            for media in program_media:
+                queue.append({**media, **ticker_tags})
+                program_since_break += float(media["duration"])
+                if not ad_media or program_since_break + 0.01 < interval_seconds:
+                    continue
+                # One scheduled break at a media boundary; carry any delay forward.
+                program_since_break = max(0.0, program_since_break - interval_seconds)
+                break_seconds = 0.0
+                while ad_media:
+                    ad = ad_media[ad_cursor % len(ad_media)]
+                    next_ad_seconds = float(ad["duration"])
+                    current_error = abs(ad_break_seconds - break_seconds)
+                    next_error = abs(ad_break_seconds - (break_seconds + next_ad_seconds))
+                    fits_target = break_seconds + next_ad_seconds <= ad_break_seconds + 0.01
+                    if not fits_target and (break_seconds > 0 or next_error + 0.01 >= current_error):
+                        break
+                    queue.append({**ad, **ticker_tags})
+                    ad_cursor += 1
+                    break_seconds += next_ad_seconds
+            carried_program_seconds = program_since_break
+            continue
         program_seconds = 0.0
         ad_seconds = 0.0
         for media_index, media in enumerate(program_media):
-            queue.append(media)
+            queue.append({**media, **ticker_tags})
             program_seconds += float(media["duration"])
             target_ad_seconds = program_seconds * (100 - share) / share
             while ad_media:
@@ -542,10 +705,10 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0) -> tuple[list[dict[str, A
                 at_program_end = media_index == len(program_media) - 1
                 if not fits_target and (not at_program_end or next_error + 0.01 >= current_error):
                     break
-                queue.append(ad)
+                queue.append({**ad, **ticker_tags})
                 ad_cursor += 1
                 ad_seconds += next_ad_seconds
-    return queue, ad_cursor
+    return queue, ad_cursor, carried_program_seconds
 
 
 def directory_role(name: str) -> str:
@@ -627,10 +790,12 @@ def is_event_active(event: dict[str, Any], now: datetime) -> bool:
     if not event["active"]:
         return False
     # Inspect today's and yesterday's start date to support overnight blocks.
-    for day_offset in (0, -1):
-        day = now + timedelta(days=day_offset)
-        weekday = day.weekday()
-        if weekday not in event["weekdays"]:
+    if event.get("schedule_date"):
+        days = [datetime.combine(date.fromisoformat(event["schedule_date"]), clock_time.min, tzinfo=BRAZIL_TZ)]
+    else:
+        days = [now + timedelta(days=offset) for offset in (0, -1)]
+    for day in days:
+        if not event.get("schedule_date") and day.weekday() not in event["weekdays"]:
             continue
         start, end = event_datetime(event, day)
         if start <= now < end:
@@ -639,37 +804,53 @@ def is_event_active(event: dict[str, Any], now: datetime) -> bool:
 
 
 def local_now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(BRAZIL_TZ)
 
 
 def find_overlaps(candidate: dict[str, Any], exclude_id: int | None = None) -> list[str]:
     existing = scheduled_events()
-    cand_days = set(candidate["weekdays"])
-    cstart, cend = as_seconds(candidate["start_time"]), as_seconds(candidate["end_time"])
-    cand_overnight = cend <= cstart
-    conflict = []
+    today = local_now().date()
+    possible_days = {today + timedelta(days=offset) for offset in range(-1, 9)}
+    for event in (candidate, *existing):
+        if event.get("schedule_date"):
+            fixed = date.fromisoformat(event["schedule_date"])
+            possible_days.update((fixed - timedelta(days=1), fixed, fixed + timedelta(days=1)))
+
+    def occurrence(event: dict[str, Any], start_day: date) -> tuple[datetime, datetime] | None:
+        if event.get("schedule_date"):
+            if start_day != date.fromisoformat(event["schedule_date"]):
+                return None
+        elif start_day.weekday() not in event["weekdays"]:
+            return None
+        start = datetime.combine(start_day, clock_time.fromisoformat(event["start_time"]))
+        end = datetime.combine(start_day, clock_time.fromisoformat(event["end_time"]))
+        if end <= start:
+            end += timedelta(days=1)
+        return start, end
+
+    conflicts = []
     for event in existing:
         if not event["active"] or event["id"] == exclude_id:
             continue
-        estart, eend = as_seconds(event["start_time"]), as_seconds(event["end_time"])
-        eovernight = eend <= estart
-        edays = set(event["weekdays"])
-        for d in cand_days:
-            # Compare intervals on a 3-day axis anchored at d; account for prior overnight events.
-            c0, c1 = d * 86400 + cstart, d * 86400 + cend + (86400 if cand_overnight else 0)
-            for ed in range(7):
-                if ed not in edays:
+        found = False
+        for start_day in possible_days:
+            candidate_occurrences = (occurrence(candidate, start_day),
+                                     occurrence(candidate, start_day - timedelta(days=1)))
+            existing_occurrences = (occurrence(event, start_day),
+                                    occurrence(event, start_day - timedelta(days=1)))
+            for candidate_bounds in candidate_occurrences:
+                if not candidate_bounds:
                     continue
-                e0, e1 = ed * 86400 + estart, ed * 86400 + eend + (86400 if eovernight else 0)
-                for shift in (-7 * 86400, 0, 7 * 86400):
-                    if max(c0, e0 + shift) < min(c1, e1 + shift):
-                        conflict.append(event["name"])
+                for existing_bounds in existing_occurrences:
+                    if existing_bounds and max(candidate_bounds[0], existing_bounds[0]) < min(candidate_bounds[1], existing_bounds[1]):
+                        conflicts.append(event["name"])
+                        found = True
                         break
-                if event["name"] in conflict:
+                if found:
                     break
-            if event["name"] in conflict:
+            if found:
                 break
-    return sorted(set(conflict))
+    return sorted(set(conflicts))
 
 
 def pick_native(kind: str) -> list[str] | str | None:
@@ -727,6 +908,7 @@ class FlowImportIn(BaseModel):
     recursive: bool = True
     mode: str = "sequential"
     program_share: int = Field(default=90, ge=50, le=100)
+    ad_break_seconds: int = Field(default=0, ge=0, le=36000)
 
 
 class FlowUpdateIn(BaseModel):
@@ -734,6 +916,7 @@ class FlowUpdateIn(BaseModel):
     mode: str | None = None
     program_share: int | None = Field(default=None, ge=50, le=100)
     recursive: bool | None = None
+    ad_break_seconds: int | None = Field(default=None, ge=0, le=36000)
 
 
 class FlowOrderIn(BaseModel):
@@ -741,7 +924,10 @@ class FlowOrderIn(BaseModel):
 
 
 class FlowProgramUpdateIn(BaseModel):
-    active: bool
+    active: bool | None = None
+    duration_seconds: int | None = Field(default=None, ge=0, le=86340)
+    content_type: str | None = None
+    ticker_enabled: bool | None = None
 
 
 class FlowProgramCreateIn(BaseModel):
@@ -774,7 +960,8 @@ class ScheduleIn(BaseModel):
     folder_id: int | None = None
     flow_id: int | None = None
     kind: str = "program"
-    weekdays: list[int] = Field(min_length=1, max_length=7)
+    weekdays: list[int] = Field(default_factory=list, max_length=7)
+    schedule_date: str | None = None
     start_time: str
     end_time: str
     transition: str = "cut"
@@ -783,6 +970,41 @@ class ScheduleIn(BaseModel):
 
 class SettingsIn(BaseModel):
     background_path: str | None = None
+
+
+class TickerConfigIn(BaseModel):
+    enabled: bool = True
+    background_color: str = Field(default="#111827", pattern=r"^#[0-9A-Fa-f]{6}$")
+    text_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    accent_color: str = Field(default="#34D399", pattern=r"^#[0-9A-Fa-f]{6}$")
+    font_size: int = Field(default=24, ge=12, le=72)
+    height: int = Field(default=72, ge=32, le=180)
+    speed_seconds: int = Field(default=32, ge=5, le=120)
+    position: str = "bottom"
+    prefix: str = Field(default="NOTÍCIAS", max_length=32)
+    separator: str = Field(default="◆", max_length=8)
+    opacity: int = Field(default=92, ge=20, le=100)
+    show_source: bool = True
+
+
+class TickerItemIn(BaseModel):
+    text: str = Field(min_length=1, max_length=360)
+    category: str = "general"
+
+
+class TickerItemUpdateIn(BaseModel):
+    active: bool
+
+
+class TickerFeedIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=8, max_length=2048)
+    category: str = "news"
+    api_token: str = Field(default="", max_length=1024)
+
+
+class TickerFeedUpdateIn(BaseModel):
+    active: bool
 
 
 class ConnectionHub:
@@ -832,6 +1054,7 @@ class PlayoutEngine:
         self.active_event: dict[str, Any] | None = None
         self.pending_event: dict[str, Any] | None = None
         self.flow_ad_cursor = 0
+        self.flow_program_progress = 0.0
         self.triggered: set[str] = set()
         self.token = 0
         self.message = "Pronto para iniciar"
@@ -866,6 +1089,8 @@ class PlayoutEngine:
             self.session_deadline = deadline
             self.active_event = event
             self.pending_event = None
+            self.flow_ad_cursor = 0
+            self.flow_program_progress = 0.0
             if not self.queue:
                 await self._stop_locked("O bloco não tem arquivos ativos.")
             else:
@@ -936,13 +1161,14 @@ class PlayoutEngine:
                 and (
                     self.source == "manual"
                     or (self.source == "schedule" and self.active_event is not None
-                        and self.active_event.get("kind") in ("program", "flow"))
+                        and self.active_event.get("kind") in ("program", "flow", "flow_program"))
                 )
             )
             if should_cycle:
-                if self.source == "schedule" and self.active_event and self.active_event.get("kind") == "flow":
-                    self.queue, self.flow_ad_cursor = build_flow_queue(
-                        int(self.active_event["flow_id"]), self.flow_ad_cursor)
+                if self.source == "schedule" and self.active_event and self.active_event.get("kind") in ("flow", "flow_program"):
+                    self.queue, self.flow_ad_cursor, self.flow_program_progress = build_flow_queue(
+                        int(self.active_event["flow_id"]), self.flow_ad_cursor, self.flow_program_progress,
+                        int(self.active_event["folder_id"]) if self.active_event.get("kind") == "flow_program" else None)
                     if not self.queue:
                         self.current = None
                         self.state = "stopped"
@@ -983,6 +1209,23 @@ class PlayoutEngine:
                     await self._advance_locked()
         await self.publish()
 
+    async def on_player_error(self, token: int) -> None:
+        """Skip a media item that the browser could not load or keep playing."""
+        async with self.lock:
+            if not self.current or token != self.token:
+                return
+            failed_name = str(self.current.get("name", "arquivo"))
+            if self.pending_event:
+                pending = dict(self.pending_event)
+                start_at = pending.pop("_start_at")
+                end_at = pending.pop("_end_at")
+                media = pending.pop("_media")
+                await self.start_scheduled_locked(pending, media, start_at, end_at)
+            else:
+                await self._advance_locked()
+            self.message = f"Falha ao reproduzir {failed_name}; pulando para o próximo arquivo."
+        await self.publish()
+
     async def report_progress(self, token: int, position: float, state: str | None = None) -> None:
         async with self.lock:
             if token != self.token or not self.current:
@@ -997,8 +1240,11 @@ class PlayoutEngine:
         flow_id = event.get("flow_id")
         folder = None
         if flow_id:
-            media, next_ad_cursor = build_flow_queue(int(flow_id), 0)
-            event = {**event, "_flow_ad_cursor": next_ad_cursor}
+            program_folder_id = int(event["folder_id"]) if event.get("kind") == "flow_program" else None
+            media, next_ad_cursor, next_program_progress = build_flow_queue(
+                int(flow_id), 0, 0.0, program_folder_id)
+            event = {**event, "_flow_ad_cursor": next_ad_cursor,
+                     "_flow_program_progress": next_program_progress}
         else:
             folder_id = int(event["folder_id"])
             media = get_folder_media(folder_id, active_only=True)
@@ -1032,6 +1278,7 @@ class PlayoutEngine:
         if flow_id:
             self.queue = [dict(m, loop_mode="once", repeat_count=1) for m in media if m.get("active", True)]
             self.flow_ad_cursor = int(event.get("_flow_ad_cursor", 0))
+            self.flow_program_progress = float(event.get("_flow_program_progress", 0.0))
         elif event["kind"] == "commercial":
             self.queue = sorted((dict(m) for m in media if m.get("active", True)),
                                 key=lambda m: (int(m.get("sort_order", 0)), int(m.get("id", 0))))
@@ -1071,9 +1318,12 @@ class PlayoutEngine:
             for event in events:
                 if not event["active"]:
                     continue
-                for day_offset in (0, -1):
-                    day = now + timedelta(days=day_offset)
-                    if day.weekday() not in event["weekdays"]:
+                if event.get("schedule_date"):
+                    occurrence_days = [datetime.combine(date.fromisoformat(event["schedule_date"]), clock_time.min, tzinfo=BRAZIL_TZ)]
+                else:
+                    occurrence_days = [now + timedelta(days=offset) for offset in (0, -1)]
+                for day in occurrence_days:
+                    if not event.get("schedule_date") and day.weekday() not in event["weekdays"]:
                         continue
                     start, end = event_datetime(event, day)
                     occurrence = f"{start.date().isoformat()}:{event['id']}:{event['start_time']}"
@@ -1111,7 +1361,7 @@ engine = PlayoutEngine()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    scheduler = AsyncIOScheduler(timezone=local_now().tzinfo)
+    scheduler = AsyncIOScheduler(timezone=BRAZIL_TZ)
     scheduler.add_job(engine.scheduler_tick, "interval", seconds=1, id="playout-clock", max_instances=1, coalesce=True)
     scheduler.start()
     app.state.scheduler = scheduler
@@ -1175,6 +1425,14 @@ async def background() -> FileResponse:
     return FileResponse(path)
 
 
+@app.get("/api/backup")
+async def download_backup() -> FileResponse:
+    path = create_database_backup()
+    if not path:
+        raise HTTPException(404, "Ainda não há uma programação salva para copiar.")
+    return FileResponse(path, filename=path.name, media_type="application/vnd.sqlite3")
+
+
 @app.post("/api/picker/folder")
 async def picker_folder() -> dict[str, Any]:
     try:
@@ -1215,7 +1473,7 @@ async def create_folder(payload: FolderIn) -> dict[str, Any]:
                 (name, str(path), int(payload.recursive), payload.mode, payload.limit_seconds,
                  payload.jingle_every, payload.sponsor_every, payload.commercial_every))
             folder_id = int(cur.lastrowid)
-    added, found = folder_scan(folder_id)
+    added, found = await asyncio.to_thread(folder_scan, folder_id)
     await engine.publish()
     return {"folder": get_folder(folder_id), "added": added, "found": found}
 
@@ -1229,6 +1487,7 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
         raise HTTPException(400, "Modo deve ser sequential ou random.")
     previous_db = DB_PATH.resolve()
     switch_workspace(root)
+    create_database_backup()
     if DB_PATH.resolve() != previous_db:
         engine.triggered.clear()
         await engine.stop("Pasta de dados alterada. Confira a programação antes de colocar no ar.")
@@ -1253,27 +1512,32 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
             program_paths = [p for p in directories if directory_role(p.name) not in ("jingle", "commercial")]
         if has_media_files(root, recursive=False) and root not in program_paths:
             program_paths.insert(0, root)
-    global_jingle_id = create_asset_group(flow_name, "Vinhetas", global_jingles, payload.mode)
-    global_commercial_id = create_asset_group(flow_name, "Comerciais", global_commercials, payload.mode)
+    global_jingle_id = await asyncio.to_thread(create_asset_group, flow_name, "Vinhetas", global_jingles, payload.mode)
+    global_commercial_id = await asyncio.to_thread(create_asset_group, flow_name, "Comerciais", global_commercials, payload.mode)
     with db() as con:
         current = con.execute("SELECT id FROM flows WHERE root_path=?", (str(root),)).fetchone()
         if current:
             flow_id = int(current["id"])
-            con.execute("""UPDATE flows SET name=?,mode=?,recursive=?,program_share=?,jingle_folder_id=?,commercial_folder_id=?
-                WHERE id=?""", (flow_name, payload.mode, int(payload.recursive), payload.program_share, global_jingle_id,
+            con.execute("""UPDATE flows SET name=?,mode=?,recursive=?,program_share=?,ad_break_seconds=?,jingle_folder_id=?,commercial_folder_id=?
+                WHERE id=?""", (flow_name, payload.mode, int(payload.recursive), payload.program_share,
+                                 payload.ad_break_seconds, global_jingle_id,
                                  global_commercial_id, flow_id))
             old_rows = con.execute("SELECT folder_id,active FROM flow_programs WHERE flow_id=? ORDER BY sort_order",
                                    (flow_id,)).fetchall()
             old_order = [int(r["folder_id"]) for r in old_rows]
             old_active = {int(r["folder_id"]): int(r["active"]) for r in old_rows}
         else:
-            cur = con.execute("""INSERT INTO flows(name,root_path,mode,recursive,program_share,jingle_folder_id,commercial_folder_id)
-                VALUES(?,?,?,?,?,?,?)""", (flow_name, str(root), payload.mode, int(payload.recursive), payload.program_share,
+            cur = con.execute("""INSERT INTO flows(name,root_path,mode,recursive,program_share,ad_break_seconds,jingle_folder_id,commercial_folder_id)
+                VALUES(?,?,?,?,?,?,?,?)""", (flow_name, str(root), payload.mode, int(payload.recursive), payload.program_share,
+                                           payload.ad_break_seconds,
                                            global_jingle_id, global_commercial_id))
             flow_id = int(cur.lastrowid)
             old_order = []
             old_active = {}
-    discovered = [create_flow_program(flow_name, path, payload.recursive, payload.mode) for path in program_paths]
+    discovered = []
+    for path in program_paths:
+        discovered.append(await asyncio.to_thread(create_flow_program, flow_name, path,
+                                                  payload.recursive, payload.mode))
     discovered_ids = [int(item["folder_id"]) for item in discovered]
     ordered_ids = [folder_id for folder_id in old_order if folder_id in discovered_ids]
     ordered_ids.extend(folder_id for folder_id in discovered_ids if folder_id not in ordered_ids)
@@ -1298,7 +1562,7 @@ async def api_flows() -> list[dict[str, Any]]:
 
 @app.post("/api/flows/{flow_id}/play")
 async def play_flow(flow_id: int) -> dict[str, Any]:
-    media, _ = build_flow_queue(flow_id, 0)
+    media, _, _ = build_flow_queue(flow_id, 0)
     if not media:
         raise HTTPException(400, "Este fluxo não tem arquivos ativos.")
     await engine.start_queue(media, "manual")
@@ -1317,11 +1581,12 @@ async def update_flow(flow_id: int, payload: FlowUpdateIn) -> dict[str, Any]:
     mode = payload.mode or flow["mode"]
     share = payload.program_share if payload.program_share is not None else flow["program_share"]
     recursive = int(payload.recursive) if payload.recursive is not None else int(flow["recursive"])
+    ad_break_seconds = payload.ad_break_seconds if payload.ad_break_seconds is not None else int(flow["ad_break_seconds"])
     if mode not in ("sequential", "random"):
         raise HTTPException(400, "Modo deve ser sequential ou random.")
     with db() as con:
-        con.execute("UPDATE flows SET name=?,mode=?,recursive=?,program_share=? WHERE id=?",
-                    (name, mode, recursive, share, flow_id))
+        con.execute("UPDATE flows SET name=?,mode=?,recursive=?,program_share=?,ad_break_seconds=? WHERE id=?",
+                    (name, mode, recursive, share, ad_break_seconds, flow_id))
     await engine.publish()
     return flow_snapshot(flow_id)
 
@@ -1418,7 +1683,7 @@ async def import_flow_program_files(flow_id: int, folder_id: int,
                 invalid.append(source.name)
                 continue
             copied += 1
-        if add_file(target_id, str(dest), source_root=destination):
+        if await asyncio.to_thread(add_file, target_id, str(dest), source_root=destination):
             added += 1
         else:
             invalid.append(source.name)
@@ -1433,9 +1698,27 @@ async def import_flow_program_files(flow_id: int, folder_id: int,
 async def update_flow_program(flow_id: int, folder_id: int,
                               payload: FlowProgramUpdateIn) -> dict[str, Any]:
     get_flow(flow_id)
+    updates: list[str] = []
+    values: list[Any] = []
+    if payload.active is not None:
+        updates.append("active=?")
+        values.append(int(payload.active))
+    if payload.duration_seconds is not None:
+        updates.append("duration_seconds=?")
+        values.append(payload.duration_seconds)
+    if payload.content_type is not None:
+        if payload.content_type not in ("general", "news", "music", "culture"):
+            raise HTTPException(400, "Categoria do programa inválida.")
+        updates.append("content_type=?")
+        values.append(payload.content_type)
+    if payload.ticker_enabled is not None:
+        updates.append("ticker_enabled=?")
+        values.append(int(payload.ticker_enabled))
+    if not updates:
+        raise HTTPException(400, "Informe uma opção do programa para salvar.")
+    values.extend((flow_id, folder_id))
     with db() as con:
-        cur = con.execute("UPDATE flow_programs SET active=? WHERE flow_id=? AND folder_id=?",
-                          (int(payload.active), flow_id, folder_id))
+        cur = con.execute(f"UPDATE flow_programs SET {', '.join(updates)} WHERE flow_id=? AND folder_id=?", values)
     if cur.rowcount == 0:
         raise HTTPException(404, "Programa não pertence a este fluxo.")
     await engine.publish()
@@ -1452,11 +1735,61 @@ async def delete_flow(flow_id: int) -> dict[str, bool]:
     return {"ok": True}
 
 
+async def execute_scan_job(job_id: str, folder_id: int) -> None:
+    cancel = SCAN_CANCELLATIONS[job_id]
+    def report_progress(scanned: int, found: int, name: str, added: int, invalid_count: int) -> None:
+        with SCAN_LOCK:
+            job = SCAN_JOBS.get(job_id)
+            if job:
+                job.update({"scanned": scanned, "found": found, "current": name,
+                            "added": added, "invalid_count": invalid_count})
+    try:
+        result = await asyncio.to_thread(folder_scan_report, folder_id, report_progress, cancel)
+        with SCAN_LOCK:
+            SCAN_JOBS[job_id].update({**result, "status": "cancelled" if result["cancelled"] else "completed",
+                                      "current": ""})
+        await engine.publish()
+    except HTTPException as exc:
+        with SCAN_LOCK:
+            SCAN_JOBS[job_id].update({"status": "failed", "error": exc.detail})
+    except Exception as exc:
+        log.exception("Falha no reescaneamento da pasta %s", folder_id)
+        with SCAN_LOCK:
+            SCAN_JOBS[job_id].update({"status": "failed", "error": str(exc)})
+
+
 @app.post("/api/folders/{folder_id}/scan")
 async def rescan_folder(folder_id: int) -> dict[str, Any]:
-    added, found = folder_scan(folder_id)
-    await engine.publish()
-    return {"added": added, "found": found}
+    get_folder(folder_id)
+    job_id = uuid4().hex
+    with SCAN_LOCK:
+        SCAN_JOBS[job_id] = {"job_id": job_id, "folder_id": folder_id, "status": "running",
+                             "scanned": 0, "found": 0, "added": 0, "invalid_count": 0,
+                             "current": "", "invalid": []}
+        SCAN_CANCELLATIONS[job_id] = Event()
+    task = asyncio.create_task(execute_scan_job(job_id, folder_id))
+    SCAN_TASKS.add(task)
+    task.add_done_callback(SCAN_TASKS.discard)
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/scans/{job_id}")
+async def scan_status(job_id: str) -> dict[str, Any]:
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Reescaneamento não encontrado ou expirado.")
+        return dict(job)
+
+
+@app.post("/api/scans/{job_id}/cancel")
+async def cancel_scan(job_id: str) -> dict[str, Any]:
+    with SCAN_LOCK:
+        job = SCAN_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Reescaneamento não encontrado ou expirado.")
+        SCAN_CANCELLATIONS[job_id].set()
+        return dict(job)
 
 
 @app.post("/api/folders/{folder_id}/import-path")
@@ -1468,7 +1801,9 @@ async def import_folder_path(folder_id: int, payload: FolderPathIn) -> dict[str,
     iterator = root.rglob("*") if payload.recursive else root.iterdir()
     paths = sorted((p for p in iterator if p.is_file() and p.suffix.lower() in SUPPORTED),
                    key=lambda p: str(p).casefold())
-    added = sum(1 for path in paths if add_file(folder_id, str(path), source_root=root))
+    added = 0
+    for path in paths:
+        added += int(await asyncio.to_thread(add_file, folder_id, str(path), source_root=root))
     await engine.publish()
     return {"added": added, "found": len(paths), "source": str(root.name)}
 
@@ -1519,7 +1854,7 @@ async def import_files(payload: FilesImport) -> dict[str, Any]:
     added = 0
     invalid: list[str] = []
     for path in payload.paths:
-        if add_file(folder_id, path):
+        if await asyncio.to_thread(add_file, folder_id, path):
             added += 1
         else:
             invalid.append(Path(path).name)
@@ -1571,7 +1906,7 @@ async def api_schedules() -> list[dict[str, Any]]:
 def normalize_schedule(payload: ScheduleIn) -> dict[str, Any]:
     if not payload.name.strip():
         raise HTTPException(400, "Informe o nome do bloco.")
-    if payload.kind not in ("program", "commercial", "flow"):
+    if payload.kind not in ("program", "commercial", "flow", "flow_program"):
         raise HTTPException(400, "Tipo de bloco inválido.")
     if payload.transition not in ("cut", "wait"):
         raise HTTPException(400, "Transição inválida.")
@@ -1582,26 +1917,43 @@ def normalize_schedule(payload: ScheduleIn) -> dict[str, Any]:
         raise HTTPException(400, "Informe horários válidos.") from exc
     if start == end:
         raise HTTPException(400, "Início e fim não podem ser iguais; use horários diferentes.")
-    if any(day not in range(7) for day in payload.weekdays):
+    schedule_date = None
+    if payload.schedule_date:
+        try:
+            schedule_date = date.fromisoformat(payload.schedule_date).isoformat()
+        except ValueError as exc:
+            raise HTTPException(400, "Informe uma data válida.") from exc
+        weekdays = [date.fromisoformat(schedule_date).weekday()]
+    else:
+        weekdays = sorted(set(payload.weekdays))
+        if not weekdays:
+            raise HTTPException(400, "Selecione dias da semana ou uma data específica.")
+    if any(day not in range(7) for day in weekdays):
         raise HTTPException(400, "Dia da semana inválido.")
     flow_id = None
     folder_id = payload.folder_id
-    if payload.kind == "flow":
+    if payload.kind in ("flow", "flow_program"):
         if not payload.flow_id:
             raise HTTPException(400, "Selecione um fluxo de programação.")
         flow_id = payload.flow_id
         get_flow(flow_id)
         programs = get_flow_programs(flow_id)
-        active_programs = [program for program in programs if program["active"]]
-        if not active_programs:
-            raise HTTPException(400, "Ative pelo menos um programa no fluxo.")
-        folder_id = int(active_programs[0]["folder_id"])
+        if payload.kind == "flow_program":
+            selected = next((program for program in programs if int(program["folder_id"]) == folder_id), None)
+            if not selected:
+                raise HTTPException(400, "Escolha um programa que pertença ao fluxo selecionado.")
+        else:
+            active_programs = [program for program in programs if program["active"]]
+            if not active_programs:
+                raise HTTPException(400, "Ative pelo menos um programa no fluxo.")
+            folder_id = int(active_programs[0]["folder_id"])
     else:
         if folder_id is None:
             raise HTTPException(400, "Selecione um programa ou playlist.")
         get_folder(folder_id)
     return {"name": payload.name.strip(), "folder_id": folder_id, "flow_id": flow_id, "kind": payload.kind,
-            "weekdays": sorted(set(payload.weekdays)), "start_time": start, "end_time": end,
+            "weekdays": weekdays, "schedule_date": schedule_date,
+            "start_time": start, "end_time": end,
             "transition": payload.transition, "active": payload.active}
 
 
@@ -1612,8 +1964,10 @@ async def create_schedule(payload: ScheduleIn) -> dict[str, Any]:
     if conflicts:
         raise HTTPException(409, "Conflito de horário com: " + ", ".join(conflicts))
     with db() as con:
-        cur = con.execute("INSERT INTO schedules(name,folder_id,flow_id,kind,weekdays,start_time,end_time,transition,active) VALUES(?,?,?,?,?,?,?,?,?)",
-                          (data["name"], data["folder_id"], data["flow_id"], data["kind"], ",".join(map(str, data["weekdays"])), data["start_time"], data["end_time"], data["transition"], int(data["active"])))
+        cur = con.execute("INSERT INTO schedules(name,folder_id,flow_id,kind,weekdays,schedule_date,start_time,end_time,transition,active) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                          (data["name"], data["folder_id"], data["flow_id"], data["kind"],
+                           ",".join(map(str, data["weekdays"])), data["schedule_date"], data["start_time"],
+                           data["end_time"], data["transition"], int(data["active"])))
         new_id = int(cur.lastrowid)
     await engine.publish()
     return next(e for e in scheduled_events() if e["id"] == new_id)
@@ -1629,8 +1983,10 @@ async def edit_schedule(schedule_id: int, payload: ScheduleIn) -> dict[str, Any]
     if conflicts:
         raise HTTPException(409, "Conflito de horário com: " + ", ".join(conflicts))
     with db() as con:
-        con.execute("UPDATE schedules SET name=?,folder_id=?,flow_id=?,kind=?,weekdays=?,start_time=?,end_time=?,transition=?,active=? WHERE id=?",
-                    (data["name"], data["folder_id"], data["flow_id"], data["kind"], ",".join(map(str, data["weekdays"])), data["start_time"], data["end_time"], data["transition"], int(data["active"]), schedule_id))
+        con.execute("UPDATE schedules SET name=?,folder_id=?,flow_id=?,kind=?,weekdays=?,schedule_date=?,start_time=?,end_time=?,transition=?,active=? WHERE id=?",
+                    (data["name"], data["folder_id"], data["flow_id"], data["kind"],
+                     ",".join(map(str, data["weekdays"])), data["schedule_date"], data["start_time"],
+                     data["end_time"], data["transition"], int(data["active"]), schedule_id))
     await engine.publish()
     return next(e for e in scheduled_events() if e["id"] == schedule_id)
 
@@ -1717,9 +2073,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             elif kind == "ended":
                 await engine.on_ended(int(message.get("token", -1)))
             elif kind == "player-error":
-                if int(message.get("token", -1)) == engine.token:
-                    engine.message = "Falha ao reproduzir a mídia. Confira o formato e o arquivo."
-                    await engine.publish()
+                await engine.on_player_error(int(message.get("token", -1)))
     except WebSocketDisconnect:
         await hub.remove(ws)
     except Exception:
