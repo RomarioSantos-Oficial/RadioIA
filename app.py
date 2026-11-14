@@ -380,7 +380,15 @@ def folder_scan(folder_id: int) -> tuple[int, int]:
 
 def list_library() -> list[dict[str, Any]]:
     with db() as con:
-        folders = con.execute("SELECT * FROM folders ORDER BY name COLLATE NOCASE,id").fetchall()
+        folders = con.execute("""SELECT f.* FROM folders f
+            WHERE NOT EXISTS (
+                SELECT 1 FROM flow_programs fp
+                WHERE fp.folder_id=f.id OR fp.jingle_folder_id=f.id OR fp.commercial_folder_id=f.id
+            ) AND NOT EXISTS (
+                SELECT 1 FROM flows fl
+                WHERE fl.jingle_folder_id=f.id OR fl.commercial_folder_id=f.id
+            )
+            ORDER BY f.name COLLATE NOCASE,f.id""").fetchall()
         result = []
         for folder in folders:
             item = row_dict(folder)
@@ -521,15 +529,22 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0) -> tuple[list[dict[str, A
         ad_media = [dict(m, loop_mode="once", repeat_count=1) for m in (*jingles, *commercials)]
         program_seconds = 0.0
         ad_seconds = 0.0
-        for media in program_media:
+        for media_index, media in enumerate(program_media):
             queue.append(media)
             program_seconds += float(media["duration"])
             target_ad_seconds = program_seconds * (100 - share) / share
-            while ad_media and ad_seconds + 0.01 < target_ad_seconds:
+            while ad_media:
                 ad = ad_media[ad_cursor % len(ad_media)]
+                next_ad_seconds = float(ad["duration"])
+                current_error = abs(target_ad_seconds - ad_seconds)
+                next_error = abs(target_ad_seconds - (ad_seconds + next_ad_seconds))
+                fits_target = ad_seconds + next_ad_seconds <= target_ad_seconds + 0.01
+                at_program_end = media_index == len(program_media) - 1
+                if not fits_target and (not at_program_end or next_error + 0.01 >= current_error):
+                    break
                 queue.append(ad)
                 ad_cursor += 1
-                ad_seconds += float(ad["duration"])
+                ad_seconds += next_ad_seconds
     return queue, ad_cursor
 
 
@@ -537,7 +552,7 @@ def directory_role(name: str) -> str:
     label = normalized_label(name).replace(" ", "")
     if "vinhet" in label or "jingle" in label:
         return "jingle"
-    if any(term in label for term in ("comercial", "commercial", "anuncio", "advert", "patroc", "sponsor")):
+    if any(term in label for term in ("comercia", "commercial", "anuncio", "anunci", "advert", "patroc", "sponsor")):
         return "commercial"
     if label in ("programas", "programs", "shows", "grade"):
         return "programs"
@@ -727,6 +742,15 @@ class FlowOrderIn(BaseModel):
 
 class FlowProgramUpdateIn(BaseModel):
     active: bool
+
+
+class FlowProgramCreateIn(BaseModel):
+    name: str
+
+
+class FlowFilesImportIn(BaseModel):
+    category: str
+    paths: list[str]
 
 
 class FilesImport(BaseModel):
@@ -1223,14 +1247,12 @@ async def import_flow_root(payload: FlowImportIn) -> dict[str, Any]:
     else:
         has_video_container = any(directory_role(p.name) == "videos" for p in directories)
         other_program_dirs = [p for p in directories if directory_role(p.name) not in ("jingle", "commercial", "videos")]
-        if has_video_container and not other_program_dirs:
-            program_paths = [root]
+        if has_video_container:
+            program_paths = [root, *other_program_dirs]
         else:
             program_paths = [p for p in directories if directory_role(p.name) not in ("jingle", "commercial")]
         if has_media_files(root, recursive=False) and root not in program_paths:
             program_paths.insert(0, root)
-    if not program_paths:
-        raise HTTPException(400, "Não encontrei pastas de programas nem vídeos diretamente na raiz.")
     global_jingle_id = create_asset_group(flow_name, "Vinhetas", global_jingles, payload.mode)
     global_commercial_id = create_asset_group(flow_name, "Comerciais", global_commercials, payload.mode)
     with db() as con:
@@ -1314,6 +1336,97 @@ async def reorder_flow_programs(flow_id: int, payload: FlowOrderIn) -> dict[str,
         con.executemany("UPDATE flow_programs SET sort_order=? WHERE flow_id=? AND folder_id=?",
                         [(i, flow_id, folder_id) for i, folder_id in enumerate(payload.folder_ids)])
     return flow_snapshot(flow_id)
+
+
+@app.post("/api/flows/{flow_id}/programs")
+async def create_flow_program_endpoint(flow_id: int, payload: FlowProgramCreateIn) -> dict[str, Any]:
+    flow = get_flow(flow_id)
+    name = payload.name.strip().rstrip(" .")
+    if not name or name in (".", "..") or any(char in name for char in '<>:"/\\|?*'):
+        raise HTTPException(400, "Informe um nome de programa válido para uma pasta do Windows.")
+    if normalized_label(name).split(".")[0] in {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}:
+        raise HTTPException(400, "Esse nome é reservado pelo Windows.")
+    root = Path(flow["root_path"]).resolve()
+    if not root.is_dir():
+        raise HTTPException(400, "A pasta raiz do fluxo não está acessível.")
+    program_parent = next((p for p in root.iterdir() if p.is_dir() and directory_role(p.name) == "programs"), root)
+    program_path = program_parent / name
+    if program_path.exists():
+        raise HTTPException(409, "Já existe uma pasta com esse nome na raiz escolhida.")
+    (program_path / "Videos").mkdir(parents=True)
+    (program_path / "Vinhetas").mkdir()
+    (program_path / "Comerciais").mkdir()
+    item = create_flow_program(flow["name"], program_path, bool(flow["recursive"]), flow["mode"])
+    with db() as con:
+        next_order = int(con.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM flow_programs WHERE flow_id=?",
+                                     (flow_id,)).fetchone()[0])
+        con.execute("""INSERT INTO flow_programs(flow_id,folder_id,jingle_folder_id,commercial_folder_id,sort_order,active)
+            VALUES(?,?,?,?,?,1)""", (flow_id, item["folder_id"], item["jingle_folder_id"],
+                                      item["commercial_folder_id"], next_order))
+    await engine.publish()
+    return flow_snapshot(flow_id)
+
+
+@app.post("/api/flows/{flow_id}/programs/{folder_id}/files")
+async def import_flow_program_files(flow_id: int, folder_id: int,
+                                    payload: FlowFilesImportIn) -> dict[str, Any]:
+    flow = get_flow(flow_id)
+    program = next((p for p in get_flow_programs(flow_id) if int(p["folder_id"]) == folder_id), None)
+    if not program:
+        raise HTTPException(404, "Programa não pertence a este fluxo.")
+    category = payload.category
+    if category not in ("videos", "jingles", "commercials"):
+        raise HTTPException(400, "Escolha vídeos, vinhetas ou comerciais.")
+    if not payload.paths:
+        raise HTTPException(400, "Nenhum arquivo foi selecionado.")
+    field = {"videos": "folder_id", "jingles": "jingle_folder_id", "commercials": "commercial_folder_id"}[category]
+    target_id = int(program[field]) if program.get(field) else None
+    if target_id is None:
+        video_path = Path(program["path"]).resolve()
+        program_path = video_path.parent if directory_role(video_path.name) == "videos" else video_path
+        child_name = {"jingles": "Vinhetas", "commercials": "Comerciais"}[category]
+        destination = program_path / child_name
+        destination.mkdir(parents=True, exist_ok=True)
+        target_id = ensure_media_folder(destination, f"{flow['name']} · {program['name']} · {child_name}",
+                                        recursive=True, mode=flow["mode"])
+        with db() as con:
+            con.execute(f"UPDATE flow_programs SET {field}=? WHERE flow_id=? AND folder_id=?",
+                        (target_id, flow_id, folder_id))
+    target_folder = get_folder(target_id)
+    destination = Path(target_folder["path"]).resolve()
+    root = Path(flow["root_path"]).resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(400, "A pasta de destino precisa ficar dentro da raiz do fluxo.") from exc
+    destination.mkdir(parents=True, exist_ok=True)
+    added, copied, invalid = 0, 0, []
+    for path_text in payload.paths:
+        source = Path(path_text).expanduser().resolve()
+        if not source.is_file() or source.suffix.lower() not in SUPPORTED:
+            invalid.append(source.name)
+            continue
+        dest = destination / source.name
+        if source != dest.resolve():
+            suffix = 2
+            while dest.exists():
+                dest = destination / f"{source.stem} ({suffix}){source.suffix}"
+                suffix += 1
+            try:
+                shutil.copy2(source, dest)
+            except OSError:
+                invalid.append(source.name)
+                continue
+            copied += 1
+        if add_file(target_id, str(dest), source_root=destination):
+            added += 1
+        else:
+            invalid.append(source.name)
+            if dest.exists() and dest.resolve() != source:
+                dest.unlink(missing_ok=True)
+    await engine.publish()
+    return {"added": added, "copied": copied, "invalid": invalid,
+            "program": program["name"], "category": category}
 
 
 @app.put("/api/flows/{flow_id}/programs/{folder_id}")

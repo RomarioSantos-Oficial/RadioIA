@@ -1,6 +1,6 @@
 # Relatório de proposta — Sistema de playout para OBS
 
-**Status:** aprovado pelo usuário; arquivos da implementação criados. A execução no ambiente ainda não foi validada.
+**Status:** aprovado pelo usu?rio; implementa??o validada em teste automatizado isolado em 14/11/2026. O teste n?o incluiu opera??o real no OBS.
 
 ## 1. Objetivo
 
@@ -18,6 +18,7 @@ Neste projeto, “leitura” significa carregar e reproduzir os arquivos de míd
 - Criar blocos de comerciais com duração prevista e uma sequência própria de anúncios, vinhetas ou outros arquivos.
 - Reunir no mesmo programa arquivos de várias pastas e identificar categorias de música, vinheta, patrocinador e comercial, com inserção configurável a cada quantidade de músicas.
 - Importar uma raiz com vários programas, vídeos e bibliotecas de vinhetas/comerciais próprias ou compartilhadas; organizar a ordem dos programas e distribuir o tempo com proporção-alvo 90/10.
+- Criar pastas de programa e importar arquivos escolhidos pelo operador, copiando-os para as pastas de Vídeos, Vinhetas e Comerciais correspondentes.
 - Repetir a sequência do programa durante o horário agendado, recomeçando a fila se os arquivos terminarem antes do horário final.
 - Acompanhar no painel o relógio, o conteúdo no ar, o progresso e o estado da automação; iniciar, pausar, avançar ou parar a reprodução.
 - Escolher execução sequencial ou aleatória por programa, avançar automaticamente após cada arquivo e exibir a duração total das mídias e a duração reservada para programas e comerciais.
@@ -72,3 +73,15 @@ O desenho é para playout local integrado ao OBS. O guia não especifica redund�
 ## 9. Base consultada
 
 Proposta elaborada a partir do [inicio.md](inicio.md) e do pedido de incluir organização de programas, sequência/duração e espaços para comerciais.
+
+## 10. Valida??o automatizada
+
+Em 14/11/2026, a aplica??o foi iniciada em uma porta local tempor?ria e testada com arquivos de m?dia de exemplo, usando uma pasta tempor?ria separada dos dados da emissora. Todos os cen?rios abaixo passaram:
+
+- Criar um fluxo em uma raiz vazia e criar as pastas V?deos, Vinhetas e Comerciais.
+- Copiar e registrar os arquivos selecionados, reconhecer as pastas no plural e ocultar pastas internas da lista de programas avulsos.
+- Gerar a fila com an?ncios sequenciais na propor??o-alvo 90/10.
+- Salvar um hor?rio, iniciar o fluxo pelo agendador e rejeitar conflitos de hor?rio.
+- Entregar m?dia ao player, avan?ar pelo evento `ended` mesmo depois de uma pausa e validar a sintaxe JavaScript das duas p?ginas.
+
+A verifica??o confirma as rotas e a l?gica local do aplicativo. A apar?ncia e o ?udio de uma transmiss?o real no OBS ainda dependem de valida??o no computador da emissora.
