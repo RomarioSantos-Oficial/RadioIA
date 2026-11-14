@@ -487,6 +487,49 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(playout.engine.active_event["id"], event["id"])
         self.assertIsNotNone(playout.engine.current)
 
+    async def test_scheduler_reclaims_active_slot_after_manual_flow_overrides_it(self) -> None:
+        folder_path = Path(self.temp.name) / "programa-agendado"
+        folder_path.mkdir()
+        media_paths = [folder_path / f"video-{index}.wav" for index in range(2)]
+        for path in media_paths:
+            make_wav(path)
+        with playout.db() as con:
+            folder_id = int(con.execute(
+                "INSERT INTO folders(name,path) VALUES(?,?)",
+                ("Programa agendado", str(folder_path)),
+            ).lastrowid)
+        for path in media_paths:
+            self.assertTrue(playout.add_file(folder_id, str(path)))
+
+        now = playout.local_now()
+        start = now - timedelta(minutes=5)
+        end = now + timedelta(minutes=30)
+        event = await playout.create_schedule(playout.ScheduleIn(
+            name="Programa no ar",
+            kind="program",
+            folder_id=folder_id,
+            schedule_date=now.date().isoformat(),
+            start_time=start.strftime("%H:%M:%S"),
+            end_time=end.strftime("%H:%M:%S"),
+            transition="wait",
+        ))
+        manual_media = playout.get_folder_media(folder_id)
+        await playout.engine.start_queue(manual_media, "manual")
+        occurrence = f"{start.date().isoformat()}:{event['id']}:{event['start_time']}"
+        playout.engine.triggered.add(occurrence)
+        playout.set_setting("automation", "1")
+
+        for _ in manual_media:
+            await playout.engine.on_ended(playout.engine.token)
+        self.assertIsNone(playout.engine.current)
+        self.assertEqual(playout.engine.message, "Fim da programação.")
+
+        await playout.engine.scheduler_tick()
+
+        self.assertEqual(playout.engine.source, "schedule")
+        self.assertEqual(playout.engine.active_event["id"], event["id"])
+        self.assertEqual(playout.engine.current["name"], "video-0.wav")
+
     async def test_scheduled_program_repeats_until_its_time_slot_ends(self) -> None:
         folder_path = Path(self.temp.name) / "programa"
         folder_path.mkdir()

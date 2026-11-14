@@ -914,6 +914,17 @@ def infer_category(path: Path, source_root: Path | None = None) -> str:
     return "music"
 
 
+def program_vignette_marker(media: dict[str, Any]) -> str | None:
+    if media.get("category") != "jingle":
+        return None
+    name = normalized_label(Path(str(media.get("name", ""))).stem)
+    if any(marker in name for marker in ("inicio", "inicial", "iniciol")):
+        return "opening"
+    if "final" in name:
+        return "closing"
+    return None
+
+
 def compose_program(media: list[dict[str, Any]], folder: dict[str, Any]) -> list[dict[str, Any]]:
     """Build a radio sequence from songs and optional timed interstitial categories."""
     media = sorted((dict(item) for item in media if item.get("active", True)),
@@ -922,12 +933,19 @@ def compose_program(media: list[dict[str, Any]], folder: dict[str, Any]) -> list
         return []
     categories = {name: [item for item in media if item.get("category", "music") == name]
                   for name in ("music", "jingle", "sponsor", "commercial", "other")}
+    opening = [dict(item, _program_marker="opening")
+               for item in categories["jingle"] if program_vignette_marker(item) == "opening"]
+    closing = [dict(item, _program_marker="closing")
+               for item in categories["jingle"] if program_vignette_marker(item) == "closing"]
+    categories["jingle"] = [item for item in categories["jingle"]
+                            if program_vignette_marker(item) is None]
     songs = categories["music"]
     if not songs:
         result = media
         if folder.get("mode") == "random":
             random.shuffle(result)
-        return result
+        return opening + [item for item in result
+                          if program_vignette_marker(item) is None] + closing
     if folder.get("mode") == "random":
         random.shuffle(songs)
     intervals = {
@@ -949,7 +967,7 @@ def compose_program(media: list[dict[str, Any]], folder: dict[str, Any]) -> list
     # Include assets whose interval is disabled, or extras beyond the configured count.
     for category in ("jingle", "sponsor", "commercial", "other"):
         result.extend(categories[category][cursors.get(category, 0):])
-    return result
+    return opening + result + closing
 
 
 def probe_media(path: Path) -> tuple[float, str]:
@@ -1221,15 +1239,23 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0,
         if flow["mode"] == "random":
             random.shuffle(program_media)
         program_media = [dict(m, loop_mode="once", repeat_count=1) for m in program_media]
+        if not program_media:
+            continue
         jingle_id = program["jingle_folder_id"] or flow["jingle_folder_id"]
         commercial_id = program["commercial_folder_id"] or flow["commercial_folder_id"]
         jingles = get_folder_media(int(jingle_id), active_only=True) if jingle_id else []
         commercials = get_folder_media(int(commercial_id), active_only=True) if commercial_id else []
-        ad_media = [dict(m, loop_mode="once", repeat_count=1) for m in (*jingles, *commercials)]
+        opening = [dict(m, loop_mode="once", repeat_count=1, _program_marker="opening")
+                   for m in jingles if program_vignette_marker(m) == "opening"]
+        closing = [dict(m, loop_mode="once", repeat_count=1, _program_marker="closing")
+                   for m in jingles if program_vignette_marker(m) == "closing"]
+        ad_media = [dict(m, loop_mode="once", repeat_count=1)
+                    for m in (*jingles, *commercials) if program_vignette_marker(m) is None]
         ticker_tags = {"flow_program_folder_id": int(program["folder_id"]),
                        "flow_program_category": program.get("content_type", "general"),
                        "flow_program_name": program.get("name", ""),
                        "ticker_enabled": bool(program.get("ticker_enabled", False))}
+        queue.extend({**item, **ticker_tags} for item in opening)
         if ad_break_seconds:
             interval_seconds = ad_break_seconds * share / max(1, 100 - share) if share < 100 else float("inf")
             program_since_break = carried_program_seconds
@@ -1253,6 +1279,7 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0,
                     ad_cursor += 1
                     break_seconds += next_ad_seconds
             carried_program_seconds = program_since_break
+            queue.extend({**item, **ticker_tags} for item in closing)
             continue
         program_seconds = 0.0
         ad_seconds = 0.0
@@ -1272,6 +1299,7 @@ def build_flow_queue(flow_id: int, ad_cursor: int = 0,
                 queue.append({**ad, **ticker_tags})
                 ad_cursor += 1
                 ad_seconds += next_ad_seconds
+        queue.extend({**item, **ticker_tags} for item in closing)
     return queue, ad_cursor, carried_program_seconds
 
 
@@ -1635,6 +1663,7 @@ class PlayoutEngine:
         self.session_deadline: float | None = None
         self.active_event: dict[str, Any] | None = None
         self.pending_event: dict[str, Any] | None = None
+        self.finishing_event = False
         self.flow_ad_cursor = 0
         self.flow_program_progress = 0.0
         self.triggered: set[str] = set()
@@ -1671,6 +1700,7 @@ class PlayoutEngine:
             self.session_deadline = deadline
             self.active_event = event
             self.pending_event = None
+            self.finishing_event = False
             self.flow_ad_cursor = 0
             self.flow_program_progress = 0.0
             if not self.queue:
@@ -1702,6 +1732,7 @@ class PlayoutEngine:
         self.session_deadline = None
         self.active_event = None
         self.pending_event = None
+        self.finishing_event = False
         self.message = message
         self.token += 1
 
@@ -1737,6 +1768,18 @@ class PlayoutEngine:
         self.repeat_number = 1
         self.queue_index += 1
         if self.queue_index >= len(self.queue):
+            if self.finishing_event:
+                await self._complete_scheduled_finish_locked()
+                return
+            scheduled_program = (
+                self.source == "schedule" and self.active_event is not None
+                and self.active_event.get("kind") in ("program", "flow", "flow_program")
+            )
+            if (scheduled_program and self.session_deadline is not None
+                    and time.monotonic() >= self.session_deadline):
+                self.current = None
+                await self._begin_scheduled_finish_locked()
+                return
             should_cycle = (
                 self.session_deadline is not None
                 and time.monotonic() < self.session_deadline
@@ -1766,6 +1809,51 @@ class PlayoutEngine:
                 self.message = "Fim da programação."
         else:
             await self._start_current_locked()
+
+    def _scheduled_closing_vignettes(self) -> list[dict[str, Any]]:
+        if not self.current:
+            return []
+        if self.current.get("_program_marker") == "closing":
+            return []
+        program_folder_id = self.current.get("flow_program_folder_id")
+        return [
+            dict(item)
+            for item in self.queue
+            if item.get("_program_marker") == "closing"
+            and (program_folder_id is None
+                 or item.get("flow_program_folder_id") == program_folder_id)
+        ]
+
+    async def _begin_scheduled_finish_locked(self) -> None:
+        if self.finishing_event:
+            return
+        prefix_length = self.queue_index + (1 if self.current else 0)
+        prefix = self.queue[:prefix_length]
+        closing = self._scheduled_closing_vignettes()
+        self.queue = prefix + closing
+        self.queue_index = prefix_length - 1 if self.current else prefix_length
+        self.session_deadline = None
+        self.finishing_event = True
+        self.message = "Finalizando o programa antes de liberar o próximo horário."
+        if not self.current:
+            if closing:
+                await self._start_current_locked()
+            else:
+                await self._complete_scheduled_finish_locked()
+
+    async def _complete_scheduled_finish_locked(self) -> None:
+        pending = self.pending_event
+        self.pending_event = None
+        self.finishing_event = False
+        if pending:
+            start_at = pending.pop("_start_at")
+            end_at = pending.pop("_end_at")
+            media = pending.pop("_media")
+            if local_now() < end_at:
+                await self.start_scheduled_locked(pending, media, start_at, end_at)
+                return
+            self.message = "O próximo bloco expirou enquanto o programa era finalizado."
+        await self._stop_locked(self.message if pending else "Fim do bloco; programação finalizada.")
 
     async def on_ended(self, token: int) -> None:
         async with self.lock:
@@ -1842,7 +1930,21 @@ class PlayoutEngine:
             deadline = min(deadline, time.monotonic() + folder["limit_seconds"])
             end = min(end, now + timedelta(seconds=folder["limit_seconds"]))
         async with self.lock:
-            if event["transition"] == "wait" and self.current and self.state in ("playing", "paused"):
+            current_scheduled_program = (
+                self.source == "schedule" and self.active_event is not None
+                and self.active_event.get("kind") in ("program", "flow", "flow_program")
+            )
+            previous_slot_ended = (
+                current_scheduled_program and self.session_deadline is not None
+                and time.monotonic() >= self.session_deadline
+            )
+            if previous_slot_ended and not self.finishing_event:
+                await self._begin_scheduled_finish_locked()
+            if self.finishing_event:
+                self.pending_event = dict(event)
+                self.pending_event.update({"_start_at": start, "_end_at": end, "_media": media})
+                self.message = f"Finalizando o programa antes de iniciar: {event['name']}"
+            elif event["transition"] == "wait" and self.current and self.state in ("playing", "paused"):
                 self.pending_event = dict(event)
                 self.pending_event.update({"_start_at": start, "_end_at": end, "_media": media})
                 self.message = f"Aguardando o fim da mídia para iniciar: {event['name']}"
@@ -1877,6 +1979,7 @@ class PlayoutEngine:
         self.queue_index = 0
         self.repeat_number = 0
         self.source = "schedule"
+        self.finishing_event = False
         remaining = (end - now).total_seconds()
         if folder and folder.get("limit_seconds"):
             remaining = min(remaining, float(folder["limit_seconds"]))
@@ -1909,10 +2012,17 @@ class PlayoutEngine:
                         continue
                     start, end = event_datetime(event, day)
                     occurrence = f"{start.date().isoformat()}:{event['id']}:{event['start_time']}"
-                    if start <= now < end and occurrence not in self.triggered:
-                        self.triggered.add(occurrence)
-                        await self.schedule_start(event, now, start, end)
-                        break
+                    if start <= now < end:
+                        active_matches = self.active_event and int(self.active_event["id"]) == int(event["id"])
+                        pending_matches = self.pending_event and int(self.pending_event["id"]) == int(event["id"])
+                        if occurrence not in self.triggered or (
+                            self.source != "schedule"
+                            and (self.current or self.message == "Fim da programação.")
+                            and not active_matches and not pending_matches
+                        ):
+                            self.triggered.add(occurrence)
+                            await self.schedule_start(event, now, start, end)
+                            break
         async with self.lock:
             if self.active_event:
                 deadline_reached = self.session_deadline is not None and time.monotonic() >= self.session_deadline
