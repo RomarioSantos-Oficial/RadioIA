@@ -5,11 +5,13 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import app as playout
 
@@ -89,6 +91,31 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.ProgrammingError):
             con.execute("SELECT 1")
 
+    def test_legacy_general_news_feeds_migrate_to_news_category(self) -> None:
+        with playout.db() as con:
+            feed_id = con.execute(
+                "INSERT INTO ticker_feeds(name,url,category) VALUES(?,?,?)",
+                ("Fonte antiga", "https://example.com/legacy-feed", "general"),
+            ).lastrowid
+            con.execute(
+                """INSERT INTO ticker_items(feed_id,external_id,text,category,source_name)
+                   VALUES(?,?,?,?,?)""",
+                (feed_id, "legacy-item", "Manchete antiga", "general", "Fonte antiga"),
+            )
+
+        playout.init_db()
+
+        with playout.db() as con:
+            feed_category = con.execute(
+                "SELECT category FROM ticker_feeds WHERE id=?", (feed_id,)
+            ).fetchone()["category"]
+            item_category = con.execute(
+                "SELECT category FROM ticker_items WHERE feed_id=?", (feed_id,)
+            ).fetchone()["category"]
+        self.assertEqual(feed_category, "news")
+        self.assertEqual(item_category, "news")
+        self.assertTrue(all(category == "news" for _, _, category in playout.DEFAULT_TICKER_FEEDS))
+
     async def test_ticker_weather_seeds_brazilian_capitals_and_one_random_city(self) -> None:
         expected_states = {state for _, state, _, _ in playout.BRAZIL_STATE_CAPITALS}
         expected_random_cities = {name for name, _, _, _ in playout.BRAZIL_RANDOM_WEATHER_CITIES}
@@ -124,12 +151,123 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
             ))
         self.assertEqual(error.exception.status_code, 400)
 
+    async def test_delete_all_ticker_items_preserves_feeds_and_removes_images(self) -> None:
+        image_dir = playout.DATA_DIR / "ticker_images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_path = "a" * 32 + ".png"
+        (image_dir / image_path).write_bytes(b"image")
+        with playout.db() as con:
+            feed_id = con.execute(
+                "INSERT INTO ticker_feeds(name,url) VALUES(?,?)",
+                ("Fonte preservada", "https://example.com/feed.xml"),
+            ).lastrowid
+            con.execute(
+                "INSERT INTO ticker_items(text,category,source_name,image_path) VALUES(?,?,?,?)",
+                ("Manual", "general", "Manual", image_path),
+            )
+            con.execute(
+                """INSERT INTO ticker_items(feed_id,external_id,text,category,source_name)
+                   VALUES(?,?,?,?,?)""",
+                (feed_id, "feed-item", "Notícia RSS", "news", "Fonte preservada"),
+            )
+
+        result = await playout.delete_all_ticker_items()
+
+        self.assertEqual(result, {"ok": True, "deleted": 2})
+        self.assertFalse((image_dir / image_path).exists())
+        with playout.db() as con:
+            item_count = con.execute("SELECT COUNT(*) FROM ticker_items").fetchone()[0]
+            feed_count = con.execute("SELECT COUNT(*) FROM ticker_feeds").fetchone()[0]
+        self.assertEqual(item_count, 0)
+        self.assertEqual(feed_count, 1)
+
     def test_ticker_weather_automatically_selects_two_capitals_and_one_city(self) -> None:
         cities = playout.ticker_weather_cities_for_display()
         random_city_names = {name for name, _, _, _ in playout.BRAZIL_RANDOM_WEATHER_CITIES}
         self.assertEqual(len(cities), 3)
         self.assertEqual(sum(city["id"].startswith("capital-") for city in cities), 2)
         self.assertEqual(sum(city["name"] in random_city_names for city in cities), 1)
+
+    def test_weather_fetch_supports_generated_string_city_ids(self) -> None:
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"current":{"temperature_2m":22,"weather_code":1}}'
+
+        class FakeOpener:
+            def open(self, _request, timeout):
+                self.timeout = timeout
+                return FakeResponse()
+
+        cities = playout.ticker_weather_cities_for_display()
+        with patch.object(playout, "build_opener", return_value=FakeOpener()):
+            items = playout.fetch_ticker_weather(cities)
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual([item["sort_order"] for item in items], [1_000_000, 1_000_001, 1_000_002])
+        self.assertTrue(all(item["text"].endswith("22°C, poucas nuvens") for item in items))
+        self.assertTrue(all(item["temperature"] == "22°C" for item in items))
+        self.assertTrue(all(item["location"].endswith((" AC", " AL", " AP", " AM", " BA",
+                                                       " CE", " DF", " ES", " GO", " MA",
+                                                       " MT", " MS", " MG", " PA", " PB",
+                                                       " PR", " PE", " PI", " RJ", " RN",
+                                                       " RS", " RO", " RR", " SC", " SP",
+                                                       " SE", " TO")) for item in items))
+
+    async def test_weather_refresh_keeps_the_same_cities_and_order(self) -> None:
+        cache = {"updated": 0.0, "items": [], "cities": [], "error": ""}
+        requested_city_ids = []
+
+        def fake_fetch(cities: list[dict]) -> list[dict]:
+            requested_city_ids.append([city["id"] for city in cities])
+            return [{"id": city["id"], "text": city["name"]} for city in cities]
+
+        with patch.dict(playout.TICKER_WEATHER_CACHE, cache, clear=True), \
+             patch.object(playout, "fetch_ticker_weather", side_effect=fake_fetch):
+            first_items, _ = await playout.ticker_weather_items()
+            playout.TICKER_WEATHER_CACHE["updated"] = 0.0
+            second_items, _ = await playout.ticker_weather_items()
+
+        self.assertEqual(len(requested_city_ids), 2)
+        self.assertEqual(requested_city_ids[0], requested_city_ids[1])
+        self.assertEqual([item["id"] for item in first_items], requested_city_ids[0])
+        self.assertEqual([item["id"] for item in second_items], requested_city_ids[0])
+
+    async def test_manual_ticker_refresh_forces_news_and_weather_updates(self) -> None:
+        cache = {"updated": 250.0, "items": [], "cities": [], "error": ""}
+        weather_cache_was_invalidated = []
+
+        async def fake_weather_items():
+            weather_cache_was_invalidated.append(playout.TICKER_WEATHER_CACHE["updated"] == 0.0)
+            return [{"id": "weather-test"}], ""
+
+        feeds = [
+            {"id": 1, "name": "Fonte ativa", "active": True, "error": ""},
+            {"id": 2, "name": "Fonte desativada", "active": False, "error": ""},
+        ]
+        with patch.dict(playout.TICKER_WEATHER_CACHE, cache, clear=True), \
+             patch.object(playout, "refresh_ticker_feeds", new_callable=AsyncMock) as refresh_feeds, \
+             patch.object(playout, "ticker_weather_items", new_callable=AsyncMock,
+                          side_effect=fake_weather_items), \
+             patch.object(playout, "ticker_feed_snapshot", return_value=feeds):
+            result = await playout.refresh_ticker_now()
+
+        refresh_feeds.assert_awaited_once()
+        self.assertEqual(weather_cache_was_invalidated, [True])
+        self.assertEqual(result, {
+            "ok": True,
+            "updated_feeds": 1,
+            "feed_errors": [],
+            "weather_count": 1,
+            "weather_error": "",
+        })
 
     def test_ticker_pruning_expires_old_news_and_enforces_configured_limit(self) -> None:
         now = datetime.now(timezone.utc)
@@ -186,6 +324,34 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
         )[0]
         self.assertTrue(json_entry["published_at"].startswith("2026-11-14T10:00:00"))
 
+    def test_ticker_hides_duplicate_and_similar_feed_headlines(self) -> None:
+        with playout.db() as con:
+            feed_id = con.execute(
+                "INSERT INTO ticker_feeds(name,url) VALUES(?,?)",
+                ("Fonte de teste", "https://example.com/feed.xml"),
+            ).lastrowid
+            headlines = [
+                ("same-1", "Prefeitura anuncia novas medidas para o transporte publico na cidade", feed_id),
+                ("same-2", "Prefeitura anuncia novas medidas para transporte público na cidade", feed_id),
+                ("different", "Seleção brasileira divulga convocados para amistosos de novembro", feed_id),
+                ("manual", "Prefeitura anuncia novas medidas para o transporte público na cidade", None),
+            ]
+            for index, (external_id, title, source_feed_id) in enumerate(headlines):
+                con.execute(
+                    """INSERT INTO ticker_items(feed_id,external_id,text,category,source_name,
+                                                updated_at,published_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (source_feed_id, external_id, title, "general", "Fonte teste",
+                     f"2026-11-14T14:{index:02}:00+00:00", f"2026-11-14T14:{index:02}:00+00:00"),
+                )
+
+        items = playout.ticker_items_for_program("general")
+
+        self.assertEqual(len(items), 3)
+        self.assertIn("Seleção brasileira divulga convocados para amistosos de novembro",
+                      [item["text"] for item in items])
+        self.assertEqual(sum("Prefeitura anuncia" in item["text"] for item in items), 2)
+
     async def test_flow_import_reads_categories_and_inserts_ads_at_configured_interval(self) -> None:
         root = self.create_station_root()
         flow = await self.import_station(root, share=75, break_seconds=2)
@@ -209,6 +375,29 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
         proportional_break = next(i for i, item in enumerate(proportional_queue)
                                   if item["folder_id"] != program_folder)
         self.assertEqual(proportional_break, 3)
+
+    async def test_random_flow_preserves_selected_ratio_and_places_breaks_between_videos(self) -> None:
+        root = self.create_station_root(media_count=18)
+        program_dir = root / "Programas" / "Manhã" / "Vídeos"
+        for path in program_dir.glob("*.wav"):
+            make_wav(path, seconds=10)
+        for folder_name in ("Vinhetas", "Comerciais"):
+            for path in (root / "Programas" / "Manhã" / folder_name).glob("*.wav"):
+                make_wav(path, seconds=10)
+
+        flow = await self.import_station(root, share=90, break_seconds=10)
+        await playout.update_flow(flow["id"], playout.FlowUpdateIn(mode="random"))
+        with patch("app.random.shuffle", side_effect=lambda media: media.reverse()):
+            queue, _, _ = playout.build_flow_queue(flow["id"])
+
+        program_folder = flow["programs"][0]["folder_id"]
+        video_items = [item for item in queue if item["folder_id"] == program_folder]
+        ad_items = [item for item in queue if item["folder_id"] != program_folder]
+        self.assertEqual(video_items[0]["name"], "programa-17.wav")
+        self.assertEqual(sum(item["duration"] for item in video_items), 180)
+        self.assertEqual(sum(item["duration"] for item in ad_items), 20)
+        self.assertTrue(queue[9]["folder_id"] != program_folder)
+        self.assertTrue(queue[-1]["folder_id"] != program_folder)
 
     async def test_schedule_supports_weekly_fixed_date_and_rejects_conflicts(self) -> None:
         root = self.create_station_root(media_count=2)
@@ -297,6 +486,43 @@ class PlayoutRegressionTests(unittest.IsolatedAsyncioTestCase):
         await playout.engine.scheduler_tick()
         self.assertEqual(playout.engine.active_event["id"], event["id"])
         self.assertIsNotNone(playout.engine.current)
+
+    async def test_scheduled_program_repeats_until_its_time_slot_ends(self) -> None:
+        folder_path = Path(self.temp.name) / "programa"
+        folder_path.mkdir()
+        media_paths = [folder_path / f"video-{index}.wav" for index in range(2)]
+        for path in media_paths:
+            make_wav(path)
+        with playout.db() as con:
+            folder_id = int(con.execute(
+                "INSERT INTO folders(name,path) VALUES(?,?)",
+                ("Programa", str(folder_path)),
+            ).lastrowid)
+        for path in media_paths:
+            self.assertTrue(playout.add_file(folder_id, str(path)))
+
+        now = playout.local_now()
+        event = {
+            "id": 1,
+            "name": "Programa de 90 minutos",
+            "kind": "program",
+            "folder_id": folder_id,
+            "transition": "cut",
+        }
+        await playout.engine.schedule_start(
+            event, now, now, now + timedelta(minutes=90))
+        self.assertEqual(playout.engine.current["name"], "video-0.wav")
+
+        await playout.engine.on_ended(playout.engine.token)
+        self.assertEqual(playout.engine.current["name"], "video-1.wav")
+        await playout.engine.on_ended(playout.engine.token)
+        self.assertEqual(playout.engine.current["name"], "video-0.wav")
+        self.assertEqual(playout.engine.queue_index, 0)
+
+        playout.engine.session_deadline = time.monotonic() - 1
+        await playout.engine.scheduler_tick()
+        self.assertIsNone(playout.engine.current)
+        self.assertEqual(playout.engine.state, "stopped")
 
     async def test_player_error_and_ended_after_pause_advance_once(self) -> None:
         media = [

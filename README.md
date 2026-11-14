@@ -32,7 +32,7 @@ Também são aceitas pastas `Vinhetas` e `Comerciais` compartilhadas na raiz. Ca
 
 Para criar um programa pelo painel, informe o nome e clique em **Criar pastas do programa**. O playout cria `Videos`, `Vinhetas` e `Comerciais` dentro da raiz do fluxo. Os botões **Vídeos +**, **Vinhetas +** e **Comerciais +** abrem o seletor de arquivos e copiam os itens escolhidos para a pasta correspondente.
 
-O fluxo usa como padrão uma proporção-alvo de 90% do tempo para vídeos dos programas e 10% para vinhetas/comerciais, calculada pelas durações dos arquivos. Essa proporção é aproximada porque os arquivos são reproduzidos até o fim. Agende o fluxo na grade usando a origem **Fluxo de programas**; ele avança ao próximo programa e repete o ciclo até o fim do horário.
+O fluxo usa como padrão 90% do tempo para vídeos dos programas e 10% para vinhetas/comerciais; ajuste **Tempo destinado aos vídeos principais (%)** para escolher outra proporção. A ordem aleatória embaralha os vídeos dentro de cada programa, mantendo vinhetas e comerciais nos intervalos. O campo **Duração de cada intervalo** define o tamanho do bloco de anúncios; a proporção determina quanto tempo de vídeo há entre os blocos. Com 90/10, por exemplo, um bloco de 10 minutos de anúncios é inserido aproximadamente a cada 90 minutos de vídeo. Os intervalos são inseridos entre arquivos, por isso a proporção final pode variar ligeiramente conforme a duração das mídias. Agende o fluxo na grade usando a origem **Fluxo de programas**; ele avança ao próximo programa e repete o ciclo até o fim do horário.
 
 ## Escolher mídias e montar programas
 

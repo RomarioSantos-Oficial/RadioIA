@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 import hashlib
 import html
 import ipaddress
@@ -307,6 +308,10 @@ def init_db() -> None:
             "UPDATE ticker_items SET updated_at=? WHERE updated_at=''",
             (local_now().isoformat(timespec="seconds"),),
         )
+        con.execute("UPDATE ticker_feeds SET category='news' WHERE category='general'")
+        con.execute("""UPDATE ticker_items SET category='news'
+            WHERE feed_id IN (SELECT id FROM ticker_feeds WHERE category='news')
+              AND category='general'""")
         flow_columns = {row["name"] for row in con.execute("PRAGMA table_info(flows)")}
         if "recursive" not in flow_columns:
             con.execute("ALTER TABLE flows ADD COLUMN recursive INTEGER NOT NULL DEFAULT 1")
@@ -399,17 +404,17 @@ def set_setting(key: str, value: str) -> None:
 
 TICKER_CATEGORIES = {"general", "news", "music", "culture"}
 TICKER_NEWS_RETENTION = timedelta(hours=12)
-TICKER_WEATHER_CACHE: dict[str, Any] = {"updated": 0.0, "items": [], "error": ""}
+TICKER_WEATHER_CACHE: dict[str, Any] = {"updated": 0.0, "items": [], "cities": [], "error": ""}
 DEFAULT_TICKER_FEEDS = (
-    ("G1 - Últimas notícias", "https://g1.globo.com/rss/g1/", "general"),
-    ("G1 - Mundo", "https://g1.globo.com/rss/g1/mundo/", "general"),
-    ("G1 - Tecnologia e games", "https://g1.globo.com/rss/g1/tecnologia/", "general"),
-    ("G1 - Cultura", "https://g1.globo.com/rss/g1/pop-arte/", "general"),
-    ("G1 - Música", "https://g1.globo.com/rss/g1/musica/", "general"),
-    ("UOL - Notícias", "https://rss.uol.com.br/feed/noticias.xml", "general"),
-    ("CNN Brasil", "https://www.cnnbrasil.com.br/feed/", "general"),
-    ("Poder360", "https://www.poder360.com.br/feed/", "general"),
-    ("BBC News Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml", "general"),
+    ("G1 - Últimas notícias", "https://g1.globo.com/rss/g1/", "news"),
+    ("G1 - Mundo", "https://g1.globo.com/rss/g1/mundo/", "news"),
+    ("G1 - Tecnologia e games", "https://g1.globo.com/rss/g1/tecnologia/", "news"),
+    ("G1 - Cultura", "https://g1.globo.com/rss/g1/pop-arte/", "news"),
+    ("G1 - Música", "https://g1.globo.com/rss/g1/musica/", "news"),
+    ("UOL - Notícias", "https://rss.uol.com.br/feed/noticias.xml", "news"),
+    ("CNN Brasil", "https://www.cnnbrasil.com.br/feed/", "news"),
+    ("Poder360", "https://www.poder360.com.br/feed/", "news"),
+    ("BBC News Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml", "news"),
 )
 
 
@@ -539,11 +544,12 @@ def fetch_ticker_weather(cities: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     items = []
 
-    def fetch_city(city: dict[str, Any]) -> dict[str, Any]:
+    def fetch_city(indexed_city: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+        index, city = indexed_city
         params = urlencode({
             "latitude": city["latitude"],
             "longitude": city["longitude"],
-            "current": "temperature_2m,weather_code",
+            "current": "temperature_2m,weather_code,is_day",
             "timezone": city["timezone"] or "auto",
         })
         request = UrlRequest(
@@ -564,18 +570,32 @@ def fetch_ticker_weather(cities: list[dict[str, Any]]) -> list[dict[str, Any]]:
             location = ", ".join(part for part in (city["name"], city["admin1"], city["country"]) if part)
         description = descriptions.get(current.get("weather_code"))
         detail = f", {description}" if description else ""
+        weather_code = current.get("weather_code")
+        if weather_code == 0:
+            weather_icon = "noite.png" if current.get("is_day") == 0 else "Sol.png"
+        elif weather_code in (1, 2):
+            weather_icon = "nublado.png"
+        elif weather_code in (3, 45, 48, 71, 73, 75, 77):
+            weather_icon = "noite_nublada.png" if current.get("is_day") == 0 else "nublado.png"
+        elif weather_code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99):
+            weather_icon = "Chuva.png"
+        else:
+            weather_icon = "nublado.png"
         return {
             "id": f"weather-{city['id']}",
             "text": f"{location} {temperature:.0f}°C{detail}",
+            "location": location,
+            "temperature": f"{temperature:.0f}°C",
+            "weather_icon": weather_icon,
             "category": "general",
             "color": "#FDE68A",
             "image_url": "",
             "active": True,
-            "sort_order": 1_000_000 + city["id"],
+            "sort_order": 1_000_000 + index,
         }
 
     with ThreadPoolExecutor(max_workers=min(10, len(cities))) as executor:
-        return list(executor.map(fetch_city, cities))
+        return list(executor.map(fetch_city, enumerate(cities)))
 
 
 def parse_ticker_published_at(value: Any) -> str:
@@ -1966,13 +1986,47 @@ def ticker_items_for_program(program_category: str | None) -> list[dict[str, Any
         allowed.add(program_category)
     placeholders = ",".join("?" for _ in allowed)
     with db() as con:
-        rows = con.execute(f"""SELECT i.id,i.text,i.category,i.source_name,i.active,i.sort_order,i.color,i.image_path
+        rows = con.execute(f"""SELECT i.id,i.feed_id,i.text,i.category,i.source_name,i.active,i.sort_order,i.color,i.image_path
             FROM ticker_items i LEFT JOIN ticker_feeds f ON f.id=i.feed_id
             WHERE i.active=1 AND (i.feed_id IS NULL OR f.active=1)
               AND i.category IN ({placeholders})
-            ORDER BY i.updated_at DESC,i.id DESC LIMIT ?""",
-            (*sorted(allowed), get_ticker_config()["max_news_items"])).fetchall()
-    return [ticker_item_output(row) for row in rows]
+            ORDER BY COALESCE(NULLIF(i.published_at,''),i.updated_at) DESC,i.updated_at DESC,i.id DESC""",
+            tuple(sorted(allowed))).fetchall()
+    unique_items: list[dict[str, Any]] = []
+    seen_headlines: list[str] = []
+    for row in rows:
+        item = row_dict(row)
+        if item["feed_id"] is not None:
+            headline = ticker_headline_key(item["text"])
+            if not headline or any(ticker_headlines_similar(headline, previous) for previous in seen_headlines):
+                continue
+            seen_headlines.append(headline)
+        item.pop("feed_id", None)
+        unique_items.append(ticker_item_output(item))
+        if len(unique_items) >= get_ticker_config()["max_news_items"]:
+            break
+    return unique_items
+
+
+def ticker_headline_key(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    without_accents = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return " ".join(re.findall(r"[a-z0-9]+", without_accents))
+
+
+def ticker_headlines_similar(first: str, second: str) -> bool:
+    if first == second:
+        return True
+    if SequenceMatcher(None, first, second, autojunk=False).ratio() >= 0.84:
+        return True
+    stop_words = {"a", "ao", "aos", "as", "com", "da", "das", "de", "do", "dos",
+                  "e", "em", "entre", "na", "nas", "no", "nos", "o", "os", "para",
+                  "por", "que", "um", "uma"}
+    first_words = {word for word in first.split() if word not in stop_words}
+    second_words = {word for word in second.split() if word not in stop_words}
+    if min(len(first_words), len(second_words)) < 4:
+        return False
+    return len(first_words & second_words) / min(len(first_words), len(second_words)) >= 0.8
 
 
 def ticker_weather_cities_for_display() -> list[dict[str, Any]]:
@@ -2002,13 +2056,14 @@ def ticker_weather_cities_for_display() -> list[dict[str, Any]]:
 async def ticker_weather_items() -> tuple[list[dict[str, Any]], str]:
     if time.monotonic() - TICKER_WEATHER_CACHE["updated"] >= 300:
         try:
-            cities = ticker_weather_cities_for_display()
+            if not TICKER_WEATHER_CACHE["cities"]:
+                TICKER_WEATHER_CACHE["cities"] = ticker_weather_cities_for_display()
+            cities = TICKER_WEATHER_CACHE["cities"]
             items = await asyncio.to_thread(fetch_ticker_weather, cities)
         except Exception as exc:
             log.warning("Não foi possível atualizar o clima do ticker: %s", exc)
             TICKER_WEATHER_CACHE.update(updated=time.monotonic(), error=str(exc)[:300])
         else:
-            random.shuffle(items)
             TICKER_WEATHER_CACHE.update(updated=time.monotonic(), items=items, error="")
     return TICKER_WEATHER_CACHE["items"], TICKER_WEATHER_CACHE["error"]
 
@@ -2042,6 +2097,25 @@ async def api_ticker_state() -> dict[str, Any]:
     return {"config": config, "show": authorized and bool(items or weather_items or config["show_clock"]),
             "program": program_name, "category": category or "general", "items": items,
             "weather": weather_items, "weather_error": weather_error}
+
+
+@app.post("/api/ticker/refresh")
+async def refresh_ticker_now() -> dict[str, Any]:
+    await refresh_ticker_feeds()
+    TICKER_WEATHER_CACHE["updated"] = 0.0
+    weather_items, weather_error = await ticker_weather_items()
+    active_feeds = [feed for feed in ticker_feed_snapshot() if feed["active"]]
+    feed_errors = [
+        {"name": feed["name"], "error": feed["error"]}
+        for feed in active_feeds if feed["error"]
+    ]
+    return {
+        "ok": not feed_errors and not weather_error,
+        "updated_feeds": len(active_feeds) - len(feed_errors),
+        "feed_errors": feed_errors,
+        "weather_count": len(weather_items),
+        "weather_error": weather_error,
+    }
 
 
 @app.get("/api/ticker/items")
@@ -2117,6 +2191,21 @@ async def delete_ticker_item(item_id: int) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.delete("/api/ticker/items")
+async def delete_all_ticker_items() -> dict[str, int]:
+    with db() as con:
+        image_paths = [
+            row["image_path"] for row in con.execute(
+                "SELECT image_path FROM ticker_items WHERE image_path!=''"
+            ).fetchall()
+        ]
+        deleted = con.execute("DELETE FROM ticker_items").rowcount
+    for image_path in image_paths:
+        if Path(image_path).name == image_path:
+            (DATA_DIR / "ticker_images" / image_path).unlink(missing_ok=True)
+    return {"ok": True, "deleted": deleted}
+
+
 @app.get("/api/ticker/weather/search")
 async def search_ticker_weather(name: str) -> list[dict[str, Any]]:
     query = name.strip()
@@ -2176,6 +2265,8 @@ async def api_ticker_feeds() -> list[dict[str, Any]]:
 @app.post("/api/ticker/feeds")
 async def create_ticker_feed(payload: TickerFeedIn) -> dict[str, Any]:
     category = payload.category.strip().lower()
+    if category == "general":
+        category = "news"
     if category not in TICKER_CATEGORIES:
         raise HTTPException(400, "Escolha uma categoria válida para a fonte.")
     try:
